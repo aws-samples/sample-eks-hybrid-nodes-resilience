@@ -1704,7 +1704,7 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: ['s3:ListBucket', 's3:ListBucketVersions']
+                Action: ['s3:ListBucket', 's3:ListBucketVersions', 's3:PutBucketLogging']
                 Resource: !GetAtt SsmOutputBucket.Arn
               - Effect: Allow
                 Action: ['s3:DeleteObject', 's3:DeleteObjectVersion']
@@ -1719,7 +1719,7 @@ Resources:
       Role: !GetAtt EmptyBucketRole.Arn
       Code:
         ZipFile: |
-          import json, urllib.request, boto3
+          import json, time, urllib.request, boto3
           def respond(event, ctx, status, reason=None):
               body = json.dumps({
                   'Status': status,
@@ -1734,17 +1734,24 @@ Resources:
               try:
                   if event['RequestType'] == 'Delete':
                       bucket = event['ResourceProperties']['Bucket']
-                      s3 = boto3.resource('s3').Bucket(bucket)
-                      # object_versions covers both versioned and unversioned buckets
-                      s3.object_versions.delete()
-                      print(f'emptied {bucket}')
+                      client = boto3.client('s3')
+                      # Stop the bucket from logging its own cleanup writes, then
+                      # drain versions and delete markers until it stays empty.
+                      client.put_bucket_logging(Bucket=bucket, BucketLoggingStatus={})
+                      for attempt in range(5):
+                          boto3.resource('s3').Bucket(bucket).object_versions.delete()
+                          time.sleep(2)
+                          page = client.list_object_versions(Bucket=bucket)
+                          remaining = len(page.get('Versions', [])) + len(page.get('DeleteMarkers', []))
+                          if not remaining and not page.get('IsTruncated'):
+                              print(f'emptied {bucket} after {attempt + 1} pass(es)')
+                              break
+                      else:
+                          raise RuntimeError(f'{bucket} still has object versions after 5 passes')
                   respond(event, ctx, 'SUCCESS')
               except Exception as e:
-                  # NEVER block a stack delete over cleanup: report success and
-                  # log it, otherwise a permissions hiccup wedges the whole
-                  # teardown and the participant is worse off than before.
                   print('empty-bucket error:', e)
-                  respond(event, ctx, 'SUCCESS', reason=str(e))
+                  respond(event, ctx, 'FAILED', reason=str(e))
 
   EmptySsmOutputBucket:
     Type: Custom::EmptyBucket
