@@ -25,7 +25,8 @@
 # What it guarantees, in order:
 #   1. the 12 expected files exist locally, none is empty, the user-data seeds are
 #      at least 200 bytes, and nothing else is under assets/workshop/ (no AWS call yet)
-#   2. the bucket is not public (get-bucket-policy-status IsPublic=true aborts)
+#   2. the bucket is not public and has a TLS-only bucket policy. A missing policy
+#      is created; any different existing policy aborts without being overwritten
 #   3. aws s3 sync --delete --exact-timestamps
 #   4. the bucket holds exactly the 12 keys, each with the local size and, under
 #      SSE-S3, the local MD5 as its ETag
@@ -104,19 +105,56 @@ done < <(find "$SRC" -type f)
 [[ "$errors" -eq 0 ]] || { echo "Aborted before any AWS call." >&2; exit 1; }
 echo "Local: ${TOTAL}/${TOTAL} files present under assets/workshop/"
 
-if [[ "$VERIFY_ONLY" != "1" ]]; then
-  # --- 2. Fail closed on exposure --------------------------------------------
-  if status_out=$(aws_ s3api get-bucket-policy-status --bucket "$BUCKET" \
-        --query 'PolicyStatus.IsPublic' --output text 2>&1); then
-    if [[ "$status_out" == "True" || "$status_out" == "true" ]]; then
-      echo "ERROR: s3://${BUCKET} has a public bucket policy (IsPublic=true). Refusing to upload." >&2
-      exit 1
-    fi
-  elif [[ "$status_out" != *NoSuchBucketPolicy* ]]; then
-    echo "ERROR: cannot read the policy status of s3://${BUCKET}: ${status_out}" >&2
+# --- 2. Fail closed on exposure and insecure transport -----------------------
+if status_out=$(aws_ s3api get-bucket-policy-status --bucket "$BUCKET" \
+      --query 'PolicyStatus.IsPublic' --output text 2>&1); then
+  if [[ "$status_out" == "True" || "$status_out" == "true" ]]; then
+    echo "ERROR: s3://${BUCKET} has a public bucket policy (IsPublic=true). Refusing to upload." >&2
     exit 1
   fi
+elif [[ "$status_out" != *NoSuchBucketPolicy* ]]; then
+  echo "ERROR: cannot read the policy status of s3://${BUCKET}: ${status_out}" >&2
+  exit 1
+fi
 
+tls_policy=$(cat <<JSON
+{"Version":"2012-10-17","Statement":[{"Sid":"DenyInsecureTransport","Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::${BUCKET}","arn:aws:s3:::${BUCKET}/*"],"Condition":{"Bool":{"aws:SecureTransport":"false"}}}]}
+JSON
+)
+expected_policy=$(printf '%s' "$tls_policy" | tr -d '[:space:]')
+
+if policy_out=$(aws_ s3api get-bucket-policy --bucket "$BUCKET" --query Policy --output text 2>&1); then
+  compact_policy=$(printf '%s' "$policy_out" | tr -d '[:space:]')
+  if [[ "$compact_policy" != "$expected_policy" ]]; then
+    echo "ERROR: s3://${BUCKET} already has a different bucket policy. Refusing to overwrite it." >&2
+    exit 1
+  fi
+  echo "TLS policy: existing DenyInsecureTransport verified"
+elif [[ "$policy_out" == *NoSuchBucketPolicy* ]]; then
+  if [[ "$VERIFY_ONLY" == "1" ]]; then
+    echo "ERROR: s3://${BUCKET} has no TLS-only bucket policy." >&2
+    exit 1
+  fi
+  aws_ s3api put-bucket-policy --bucket "$BUCKET" --policy "$tls_policy"
+  policy_out=""
+  for attempt in 1 2 3 4 5; do
+    if policy_out=$(aws_ s3api get-bucket-policy --bucket "$BUCKET" --query Policy --output text 2>&1); then
+      break
+    fi
+    [[ "$attempt" -eq 5 ]] || sleep 2
+  done
+  compact_policy=$(printf '%s' "$policy_out" | tr -d '[:space:]')
+  if [[ "$compact_policy" != "$expected_policy" ]]; then
+    echo "ERROR: s3://${BUCKET} TLS-only policy did not persist as written." >&2
+    exit 1
+  fi
+  echo "TLS policy: DenyInsecureTransport created and verified"
+else
+  echo "ERROR: cannot read the bucket policy of s3://${BUCKET}: ${policy_out}" >&2
+  exit 1
+fi
+
+if [[ "$VERIFY_ONLY" != "1" ]]; then
   # --- 3. Upload -------------------------------------------------------------
   echo "Publishing assets/workshop/ to s3://${BUCKET}/${DEST_PREFIX}"
   aws_ s3 sync "${SRC}/" "s3://${BUCKET}/${DEST_PREFIX}" --delete --exact-timestamps

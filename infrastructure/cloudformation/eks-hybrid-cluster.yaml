@@ -166,7 +166,14 @@ Resources:
       RoleName: eks-hybrid-nodes-role
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
-        Statement: [{Effect: Allow, Principal: {Service: ssm.amazonaws.com}, Action: ['sts:AssumeRole']}]
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ssm.amazonaws.com}
+            Action: ['sts:AssumeRole']
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+              ArnEquals:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:*'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
@@ -286,10 +293,23 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Effect: Allow
-            Principal: {Service: [events.amazonaws.com, sqs.amazonaws.com]}
+          - Sid: AllowEventBridgeRules
+            Effect: Allow
+            Principal: {Service: events.amazonaws.com}
             Action: 'sqs:SendMessage'
             Resource: !GetAtt KarpenterInterruptionQueue.Arn
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+              ArnEquals:
+                'aws:SourceArn':
+                  - !GetAtt SpotInterruptionRule.Arn
+                  - !GetAtt RebalanceRule.Arn
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 'sqs:*'
+            Resource: !GetAtt KarpenterInterruptionQueue.Arn
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
 
   SpotInterruptionRule:
     Type: AWS::Events::Rule
@@ -326,12 +346,28 @@ Resources:
             Resource: '*'
       Tags: [{Key: workshop, Value: !Ref WorkshopName}]
 
+  ClusterControlPlaneLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/cluster'
+      RetentionInDays: 7
+      Tags: [{Key: workshop, Value: !Ref WorkshopName}]
+
   Cluster:
     Type: AWS::EKS::Cluster
+    DependsOn: ClusterControlPlaneLogGroup
     Properties:
       Name: !Ref ClusterName
       Version: !Ref KubernetesVersion
       RoleArn: !GetAtt ClusterRole.Arn
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - {Type: api}
+            - {Type: audit}
+            - {Type: authenticator}
       EncryptionConfig:
         - Provider: {KeyArn: !GetAtt ClusterSecretsKey.Arn}
           Resources: [secrets]

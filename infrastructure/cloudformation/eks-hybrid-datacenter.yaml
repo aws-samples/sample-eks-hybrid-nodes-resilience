@@ -295,6 +295,9 @@ Resources:
               runCommand:
                 - |
                   set -uxo pipefail
+                  umask 077
+                  VPN_XML=$(mktemp /tmp/aws-vpn.XXXXXX)
+                  trap 'rm -f "$VPN_XML"' EXIT
                   # libreswan, NOT strongswan: it is the only IPsec stack in the
                   # AL2023 repos (validated 2026-08-06). iptables-nft provides the
                   # iptables command (AL2023 ships nftables only).
@@ -303,7 +306,7 @@ Resources:
                   TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
                   REGION=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
                   aws ec2 describe-vpn-connections --vpn-connection-ids {{ VpnConnectionId }} --region "$REGION" \
-                    --query 'VpnConnections[0].CustomerGatewayConfiguration' --output text > /tmp/vpn.xml
+                    --query 'VpnConnections[0].CustomerGatewayConfiguration' --output text > "$VPN_XML"
                   #
                   # ROUTE-BASED (VTI), not policy-based. A Transit Gateway VPN
                   # negotiates 0.0.0.0/0 traffic selectors, so per-subnet policy
@@ -311,9 +314,9 @@ Resources:
                   # 10.90<->10.42 SA came up and every cloud->VM packet blackholed
                   # while the tunnels showed UP. With VTI there is ONE SA per
                   # tunnel and plain IP routing decides what enters it.
-                  EKS_CIDR="{{ EksVpcCidrParam }}" python3 - <<'PY'
+                  VPN_XML="$VPN_XML" EKS_CIDR="{{ EksVpcCidrParam }}" python3 - <<'PY'
                   import os, xml.etree.ElementTree as ET
-                  root = ET.parse('/tmp/vpn.xml').getroot()
+                  root = ET.parse(os.environ['VPN_XML']).getroot()
                   conns, secrets, vtis = [], [], []
                   for i, t in enumerate(root.findall('.//ipsec_tunnel'), 1):
                       cgw_out = t.find('.//customer_gateway/tunnel_outside_address/ip_address').text
@@ -352,6 +355,8 @@ Resources:
                   open('/tmp/vti-plan','w').write('\n'.join(vtis)+'\n')
                   print(f"rendered {len(secrets)} VTI tunnels")
                   PY
+                  rm -f "$VPN_XML"
+                  trap - EXIT
                   chmod 600 /etc/ipsec.d/aws-vpn.secrets
                   # forwarding; rp_filter off (asymmetric paths are normal here)
                   cat > /etc/sysctl.d/99-vpn.conf <<'SYSCTL'
@@ -571,7 +576,14 @@ Resources:
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
-        Statement: [{Effect: Allow, Principal: {Service: fis.amazonaws.com}, Action: 'sts:AssumeRole'}]
+        Statement:
+          - Effect: Allow
+            Principal: {Service: fis.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment/*'
       Policies:
         - PolicyName: network-disrupt
           PolicyDocument:

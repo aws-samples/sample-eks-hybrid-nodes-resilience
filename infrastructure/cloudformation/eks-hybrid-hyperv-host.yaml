@@ -250,7 +250,14 @@ Resources:
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
-        Statement: [{Effect: Allow, Principal: {Service: ssm.amazonaws.com}, Action: 'sts:AssumeRole'}]
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ssm.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-execution/*'
       Policies:
         - PolicyName: hyperv-automation
           PolicyDocument:

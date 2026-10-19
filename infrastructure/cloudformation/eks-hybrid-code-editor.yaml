@@ -940,7 +940,7 @@ Resources:
                   # --- KEDA (pod-level autoscaling, module 6.4)
                   helm repo add kedacore https://kedacore.github.io/charts >/dev/null 2>&1
                   helm repo update >/dev/null 2>&1
-                  helm upgrade --install keda kedacore/keda --namespace keda \
+                  helm upgrade --install keda kedacore/keda --version 2.21.0 --namespace keda \
                     --create-namespace --wait --timeout 10m
 
                   # --- EC2NodeClass + burst NodePools (module 6 inspects these).
@@ -1077,7 +1077,7 @@ Resources:
                   # at STEADY STATE (caught in the v5 Dev validation 2026-08-06).
                   helm repo add metallb https://metallb.github.io/metallb >/dev/null 2>&1
                   helm repo update >/dev/null 2>&1
-                  helm upgrade --install metallb metallb/metallb \
+                  helm upgrade --install metallb metallb/metallb --version 0.16.1 \
                     --namespace metallb-system --create-namespace \
                     --set speaker.frr.enabled=false \
                     --set frrk8s.enabled=false \
@@ -1507,6 +1507,22 @@ Resources:
             ExpirationInDays: 7
             NoncurrentVersionExpiration: {NoncurrentDays: 1}
             AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+
+  SsmOutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SsmOutputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SsmOutputBucket.Arn
+              - !Sub '${SsmOutputBucket.Arn}/*'
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
 
   IdeArtifactBucketParameter:
     Type: AWS::SSM::Parameter

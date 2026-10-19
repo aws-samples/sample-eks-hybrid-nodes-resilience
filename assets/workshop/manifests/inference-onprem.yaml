@@ -162,6 +162,9 @@ spec:
             periodSeconds: 10
         - name: metrics-proxy
           image: public.ecr.aws/docker/library/python:3.12-alpine
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
           command: ["python3", "/app/proxy.py"]
           env:
             - {name: PARALLEL, value: "2"}
@@ -235,6 +238,9 @@ spec:
           # needed internet at pod start, which is exactly what a hybrid node
           # cannot count on (it printed "curl unavailable" and slept forever).
           image: public.ecr.aws/docker/library/busybox:1.37
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -273,6 +279,9 @@ spec:
           # needed internet at pod start, which is exactly what a hybrid node
           # cannot count on (it printed "curl unavailable" and slept forever).
           image: public.ecr.aws/docker/library/busybox:1.37
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -338,6 +347,9 @@ spec:
           # needed internet at pod start, which is exactly what a hybrid node
           # cannot count on (it printed "curl unavailable" and slept forever).
           image: public.ecr.aws/docker/library/busybox:1.37
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -377,6 +389,9 @@ spec:
       containers:
         - name: generator
           image: public.ecr.aws/docker/library/busybox:1.37
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
           command: ["/bin/sh", "-c"]
           args:
             - |

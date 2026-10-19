@@ -86,6 +86,9 @@ spec:
             periodSeconds: 10
         - name: metrics-proxy
           image: public.ecr.aws/docker/library/python:3.12-alpine
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
           command: ["python3", "/app/proxy.py"]
           env:
             - {name: PARALLEL, value: "2"}
