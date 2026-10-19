@@ -1,0 +1,969 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EKS Hybrid Nodes Workshop - EKS Standard cluster (public endpoint) with a small
+  managed node group, Karpenter for cloud burst, and the add-ons validated for
+  hybrid nodes (CoreDNS, kube-proxy, VPC CNI, Pod Identity, CloudWatch
+  Observability, ADOT, cert-manager, metrics-server, node-exporter,
+  kube-state-metrics) plus an AMP workspace.
+
+# ============================================================================
+# DESIGN DECISIONS
+#
+# 1. EKS STANDARD, not Auto Mode.
+#    Auto Mode hides the node provisioning layer, and module 6 teaches exactly
+#    that layer (NodePool tuning, od/spot split, consolidation, KEDA + Karpenter).
+#    It also does NOT install CoreDNS (validated 2026-08-04: a live Auto Mode
+#    cluster had no coredns deployment, no kube-dns service, and pods got a
+#    nameserver nothing answered), so DNS had to be added back anyway.
+#
+# 2. PUBLIC endpoint only.
+#    Private access adds security-group plumbing between the IDE and the private
+#    ENIs for zero teaching value in a workshop (it cost a full debugging round:
+#    kubectl from the IDE timed out against 10.42.x.x:443). It also matches the
+#    lab narrative: in module 5.2 the kubelet keeps reaching the control plane
+#    over the internet, which is why nodes stay Ready until the control plane
+#    path is blocked explicitly.
+#
+# 3. Managed node group (2x m7i.large) as the baseline cloud capacity.
+#    Karpenter itself must run somewhere that Karpenter does not manage.
+#
+# 4. ADD-ON COMPATIBILITY WITH HYBRID NODES (docs: hybrid-nodes-add-ons.html)
+#    Installed and hybrid-compatible: coredns, kube-proxy, eks-pod-identity-agent,
+#    amazon-cloudwatch-observability, adot, cert-manager, metrics-server,
+#    prometheus-node-exporter, kube-state-metrics.
+#    Installed but CLOUD-ONLY BY DESIGN: vpc-cni (not compatible with hybrid
+#    nodes - recent versions carry an anti-affinity rule on the
+#    eks.amazonaws.com/compute-type=hybrid label, so it simply never lands on
+#    them). Hybrid nodes get Cilium, installed by participants in module 2.4.
+#    Deliberately absent: aws-ebs-csi-driver (regional storage, unusable during
+#    a disconnection).
+#
+#    IMDS caveat that drives module 5 content: CloudWatch Container Insights
+#    cannot collect NODE-level metrics from hybrid nodes because it depends on
+#    IMDS, which does not exist on-premises. Cluster/workload/pod/container
+#    metrics do work. That gap is exactly why the workshop also runs a local
+#    metrics stack on the hybrid nodes.
+#
+#    The CloudWatch AGENT is therefore pinned OFF hybrid nodes via the add-on's
+#    affinity (see ConfigurationValues below). Without that it crash-loops
+#    forever trying to authenticate with no IMDS and no Pod Identity.
+# ============================================================================
+
+Parameters:
+  ParticipantRoleArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Workshop Studio participant role ({{.ParticipantRoleArn}} magic variable).
+      Gets a ClusterAdmin access entry so the AWS console shows nodes/workloads.
+      Empty (e.g. Dev validation) = no entry created.
+  WorkshopName:
+    Type: String
+    Default: eks-hybrid
+  ClusterName:
+    Type: String
+    Default: eks-hybrid-workshop
+  KubernetesVersion:
+    Type: String
+    Default: '1.36'
+    Description: >-
+      Latest EKS version at authoring time (standard support until 2027-08-01).
+      1.33 left standard support on 2026-07-28 - never ship a workshop on a
+      version in extended support.
+  KarpenterVersion:
+    Type: String
+    Default: '1.14.0'
+    Description: Karpenter chart version (pinned - latest at authoring time)
+  RemoteNodeCidr:
+    Type: String
+    Default: 10.80.0.0/16
+  RemotePodCidr:
+    Type: String
+    Default: 10.85.0.0/16
+  NodeInstanceType:
+    Type: String
+    Default: t4g.xlarge
+    Description: >-
+      Graviton (ARM64). Single node hosting ALL cloud-side components: add-ons,
+      Karpenter, KEDA, MetalLB controller and the Cilium operator (~1.9 vCPU of
+      requests). t4g.large (2 vCPU) left ~330m short and forced a permanent
+      burst node at STEADY STATE - violating the zero-cost-at-rest design
+      (caught in the v5 Dev validation 2026-08-06). t4g.xlarge (4 vCPU, 58
+      pods) fits everything with headroom. Everything that matters for the
+      workshop runs on the hybrid nodes or on burst nodes Karpenter creates.
+  SubnetIds:
+    Type: AWS::SSM::Parameter::Value<List<String>>
+    Default: /workshop/eks-hybrid/cluster-subnets
+
+  # ---- merged from eks-hybrid-images.yaml
+  # The inference images are built in THIS account from the official Ollama
+  # release, pinned by digest (an image index: docker picks the amd64 entry), and
+  # the model weights are downloaded during that build from registry.ollama.ai.
+  # Nothing comes from a third-party mirror, and this repository ships no model.
+  OllamaImage:
+    Type: String
+    # ollama/ollama:0.5.7, digest read from Docker Hub on 2026-10-14
+    Default: docker.io/ollama/ollama@sha256:7e672211886f8bd4448a98ed577e26c816b9e8b052112860564afaa2c105800e
+    Description: Base image of the inference images (official Ollama 0.5.7, pinned by digest)
+
+Conditions:
+  HasParticipantRole: !Not [!Equals [!Ref ParticipantRoleArn, '']]
+
+Resources:
+  # ------------------------------------------------------------------ IAM
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: eks.amazonaws.com}
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        # The EKS Hybrid Nodes gateway maintains the VPC route table entries that
+        # point the on-premises POD CIDR at whichever gateway instance currently
+        # holds the leader lease. Without these it starts, wins the election, and
+        # then cannot program the route - so cloud-to-pod traffic never works and
+        # the failure is silent (the pods look healthy).
+        # Granted on the node role because the gateway pods run on the gateway
+        # node group; the alternative is a Pod Identity association, which is more
+        # moving parts for the same outcome in a single-cluster lab.
+        - PolicyName: hybrid-nodes-gateway-routes
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateRoute
+                  - ec2:ReplaceRoute
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:route-table/*'
+
+  # Referenced BY NAME in content page 2.1 (participants bind the SSM activation to it)
+  HybridNodesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: eks-hybrid-nodes-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ssm.amazonaws.com}, Action: ['sts:AssumeRole']}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+      Policies:
+        - PolicyName: eks-describe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # nodeadm init runs a PREFLIGHT VALIDATION that lists the cluster's
+              # access entries to confirm a HYBRID_LINUX entry exists for this
+              # role. Without ListAccessEntries the join dies with a 403 and the
+              # node never registers - it would break EVERY event (caught in the
+              # v5 e2e 2026-08-06: SSM activation succeeded, mi-* instance
+              # registered, and `nodeadm init` still failed fatally).
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListAccessEntries
+                  - eks:DescribeAccessEntry
+                Resource: !Sub 'arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}'
+
+  # Karpenter controller (Pod Identity, no IRSA/OIDC plumbing needed)
+  KarpenterControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      Policies:
+        - PolicyName: karpenter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # read-only discovery: Describe*/pricing have no resource-level
+              # support in IAM - '*' is unavoidable and safe (read-only)
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - pricing:GetProducts
+                Resource: '*'
+              - Effect: Allow
+                Action: ['eks:DescribeCluster']
+                Resource: !Sub 'arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}'
+              # AMI discovery only (public SSM namespace, account-less ARN)
+              - Effect: Allow
+                Action: ['ssm:GetParameter']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/service/*'
+              # node lifecycle writes: scoped to THIS region's EC2 resources
+              - Effect: Allow
+                Action:
+                  - ec2:RunInstances
+                  - ec2:CreateFleet
+                  - ec2:CreateLaunchTemplate
+                  - ec2:CreateTags
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::snapshot/*'
+              # destruction only of resources Karpenter itself created (official
+              # karpenter.sh pattern: every NodeClaim resource carries this tag)
+              - Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                  - ec2:DeleteLaunchTemplate
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:*'
+                Condition:
+                  StringLike: {'aws:ResourceTag/karpenter.sh/nodepool': '*'}
+              - Effect: Allow
+                Action: ['iam:PassRole']
+                Resource: !GetAtt NodeRole.Arn
+              # Karpenter v1 manages the EC2 instance profile for each
+              # EC2NodeClass itself. Without these the NodeClass never becomes
+              # Ready and no burst node is ever launched (found via the Karpenter
+              # controller logs: AccessDenied on iam:GetInstanceProfile).
+              # Scoped to instance-profile ARNs (List* has no resource support).
+              - Effect: Allow
+                Action:
+                  - iam:CreateInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagInstanceProfile
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*'
+              - Effect: Allow
+                Action: ['iam:ListInstanceProfiles']
+                Resource: '*'
+              - Effect: Allow
+                Action: ['sqs:DeleteMessage', 'sqs:GetQueueUrl', 'sqs:ReceiveMessage']
+                Resource: !GetAtt KarpenterInterruptionQueue.Arn
+              # Fresh accounts (EVERY Workshop Studio account) lack the EC2 Spot
+              # service-linked role; the first spot CreateFleet fails with
+              # ServiceLinkedRoleCreationNotPermitted without this (caught in the
+              # v5 Dev validation 2026-08-06 - would break module 6 at events).
+              # Condition-scoped to the Spot SLR only (official karpenter.sh pattern).
+              - Effect: Allow
+                Action: ['iam:CreateServiceLinkedRole']
+                Resource: '*'
+                Condition:
+                  StringEquals: {'iam:AWSServiceName': 'spot.amazonaws.com'}
+
+  # Spot interruption / rebalance handling (Karpenter best practice)
+  KarpenterInterruptionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ClusterName}-karpenter'
+      MessageRetentionPeriod: 300
+      SqsManagedSseEnabled: true
+
+  KarpenterInterruptionQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref KarpenterInterruptionQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: [events.amazonaws.com, sqs.amazonaws.com]}
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt KarpenterInterruptionQueue.Arn
+
+  SpotInterruptionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern: {source: [aws.ec2], detail-type: [EC2 Spot Instance Interruption Warning]}
+      Targets: [{Id: karpenter, Arn: !GetAtt KarpenterInterruptionQueue.Arn}]
+
+  RebalanceRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern: {source: [aws.ec2], detail-type: [EC2 Instance Rebalance Recommendation]}
+      Targets: [{Id: karpenter, Arn: !GetAtt KarpenterInterruptionQueue.Arn}]
+
+  # ------------------------------------------------------------------ Cluster
+  # Envelope encryption of Kubernetes Secrets with a customer managed key. The
+  # key policy only delegates to IAM in this account; EKS creates its grant with
+  # the credentials that create the cluster. Deleted with the stack after a
+  # 7-day waiting period (the cluster is deleted first).
+  ClusterSecretsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub 'Envelope encryption of Kubernetes Secrets in ${ClusterName}'
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministrationThroughIam
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'}
+            Action: 'kms:*'
+            Resource: '*'
+      Tags: [{Key: workshop, Value: !Ref WorkshopName}]
+
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      EncryptionConfig:
+        - Provider: {KeyArn: !GetAtt ClusterSecretsKey.Arn}
+          Resources: [secrets]
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      ResourcesVpcConfig:
+        SubnetIds: !Ref SubnetIds
+        # Public only - see design decision 2 in the header
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: false
+      RemoteNetworkConfig:
+        RemoteNodeNetworks: [{Cidrs: [!Ref RemoteNodeCidr]}]
+        RemotePodNetworks: [{Cidrs: [!Ref RemotePodCidr]}]
+      Tags:
+        - {Key: workshop, Value: !Ref WorkshopName}
+
+  HybridAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !GetAtt HybridNodesRole.Arn
+      Type: HYBRID_LINUX
+
+  # Participants must SEE and OPERATE the cluster from the AWS console
+  # (Nodes tab, workloads, etc). Without this entry the console shows an
+  # access error even though the IDE's kubectl works (caught in the first
+  # test event, where the permissions had to be added by hand).
+  ParticipantAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasParticipantRole
+    Properties:
+      ClusterName: !Ref Cluster
+      PrincipalArn: !Ref ParticipantRoleArn
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope: {Type: cluster}
+
+  # EKS auto-creates TCP ingress for the remote CIDRs on the cluster security
+  # group when remoteNetworkConfig is set - but ONLY TCP. DNS is UDP/53, so
+  # every query from a hybrid pod to the CLOUD CoreDNS replica timed out, which
+  # showed up as random resolution failures across the cluster (caught in the
+  # v5 e2e 2026-08-06: one client pod resolved fine, the next one could not,
+  # depending on which replica the kube-dns Service happened to pick).
+  # These two rules complete the picture for the whole remote network.
+  ClusterSgFromRemoteNodes:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt Cluster.ClusterSecurityGroupId
+      # '-1' = every protocol, which also covers the gateway's VXLAN on UDP 8472.
+      # Listing 8472 separately would be documentation, not function.
+      IpProtocol: '-1'
+      CidrIp: !Ref RemoteNodeCidr
+      Description: All traffic from the remote node network (on-premises)
+  ClusterSgFromRemotePods:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt Cluster.ClusterSecurityGroupId
+      IpProtocol: '-1'
+      CidrIp: !Ref RemotePodCidr
+      Description: All traffic from the remote pod network (on-premises)
+
+  # Baseline cloud capacity: ONE small Graviton node.
+  # Its only job is to host the add-ons, the Karpenter controller and KEDA -
+  # Karpenter needs a home that Karpenter itself does not manage. Every burst
+  # node in module 6 is created by Karpenter, not here.
+  # ARM64 note: all installed add-ons, Karpenter and KEDA ship multi-arch images.
+  # Burst NodePools explicitly allow amd64 (GPU g6 instances are x86).
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: [CoreDnsAddon, KubeProxyAddon, VpcCniAddon]
+    Properties:
+      ClusterName: !Ref Cluster
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets: !Ref SubnetIds
+      InstanceTypes: [!Ref NodeInstanceType]
+      AmiType: AL2023_ARM_64_STANDARD
+      # Desired 1 (lab). Max 2 only so a node replacement can roll without an outage.
+      ScalingConfig: {MinSize: 1, DesiredSize: 1, MaxSize: 2}
+      Labels: {workshop-role: cloud-baseline}
+      Tags: {workshop: !Ref WorkshopName}
+
+  # The gateway runs on DEDICATED capacity, as a managed node group rather than
+  # anything Karpenter provisions. Three reasons it is deliberately a MNG:
+  #   - it must exist BEFORE any workload needs cloud-to-pod connectivity, so it
+  #     cannot depend on a scheduler reacting to pending pods;
+  #   - Karpenter consolidation would happily reclaim a node whose only tenant is
+  #     the standby gateway pod, which is exactly the pod you need on failover;
+  #   - source/destination check has to be disabled on the ENI, which is launch
+  #     template territory.
+  # Two nodes because the gateway is active-standby with a Kubernetes Lease: the
+  # standby keeps its VXLAN interface warm and takes over in ~3-5s. With one node
+  # a gateway restart is a cloud-to-pod outage.
+  # The taint keeps every other workshop workload off these nodes. Nothing new
+  # appears in Access Entries: they reuse the SAME NodeRole as the baseline group,
+  # and access entries are per IAM ROLE, not per node.
+  GatewayNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: [CoreDnsAddon, KubeProxyAddon, VpcCniAddon]
+    Properties:
+      ClusterName: !Ref Cluster
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets: !Ref SubnetIds
+      InstanceTypes: [t3.large]
+      AmiType: AL2023_x86_64_STANDARD
+      ScalingConfig: {MinSize: 2, DesiredSize: 2, MaxSize: 2}
+      Labels: {hybrid-gateway-node: 'true', workshop-role: gateway}
+      Taints:
+        - Key: hybrid-gateway-node
+          Value: 'true'
+          Effect: NO_SCHEDULE
+      Tags: {workshop: !Ref WorkshopName}
+
+  # ------------------------------------------------------------------ Core add-ons
+  # These three come first: the node group cannot become Ready without them.
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+
+  # CoreDNS: 1 replica initially - there is only ONE cloud node, and the default
+  # anti-affinity would leave a second replica Pending. Module 4.3 scales it to 3
+  # (one per node: 1 cloud + 2 hybrid) as part of the DNS resiliency fix.
+  # Production guidance taught in 4.3: set replicaCount and topology spread here
+  # with resolveConflicts PRESERVE so add-on updates do not revert the config.
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+      # TWO replicas, BOTH IN THE CLOUD - on purpose.
+      # replicaCount 1 is not an option: the single pod can land on a hybrid node
+      # and then every cloud-side pod loses DNS - Karpenter crash-looped with
+      # "lookup ec2.us-west-2.amazonaws.com: i/o timeout" and no burst was
+      # possible (caught in the v5 e2e 2026-08-06). What follows is also
+      # exactly what AWS recommends for hybrid clusters (>=1 in each location)
+      # PINNED TO THE CLOUD, deliberately - and this is the third iteration, so the
+      # two rejected designs are recorded to stop anyone reintroducing them:
+      #   - `required` hostname anti-affinity with UNTAINTED burst pools: the
+      #     second replica is unschedulable at boot (one cloud node; hybrid joins
+      #     minutes later) so Karpenter buys a c7i.large purely to host it, and
+      #     keeps it forever. Zero-cost-at-rest gone.
+      #   - `preferred` anti-affinity: the scheduler may co-locate, and did. Worse,
+      #     on event 66489015 BOTH replicas ended up on HYBRID nodes, so the cloud
+      #     side had no local DNS: KEDA failed every Prometheus query with
+      #     "no such host" and module 6.4 silently stopped autoscaling.
+      # Hostname anti-affinity guarantees different HOSTS, never different
+      # LOCATIONS, and cloud nodes carry no compute-type label to spread on. So the
+      # add-on's replicas are pinned OFF hybrid nodes. Cloud-side DNS is then
+      # guaranteed for KEDA, Karpenter and every cloud pod, at no cost (two small
+      # replicas fit the baseline node), and the burst pools stay tainted so no
+      # kube-system pod can ever trigger cloud capacity.
+      # The pedagogical win matters as much as the technical one: module 5.4 opens
+      # by having the participant DISCOVER that name resolution still lives in the
+      # cloud. With replicas wandering onto hybrid nodes that premise was luck.
+      # Now it is true by construction, and 5.4's per-node CoreDNS fix is what
+      # brings DNS on-premises - which is exactly the lesson.
+      # The history is worth keeping, because both naive options are wrong:
+      #   - `required` with untainted burst pools: the second replica is
+      #     unschedulable at boot (one cloud node, hybrid joins minutes later), so
+      #     Karpenter buys a c7i.large purely to host it and keeps it forever.
+      #   - `preferred`: the scheduler is free to co-locate, and it DID - both
+      #     replicas ended up on the SAME hybrid node, leaving the cloud side with
+      #     no local DNS. KEDA then failed every Prometheus query with
+      #     "no such host" and module 6.4 silently stopped working.
+      # With the burst pools tainted (workshop-role=burst:NoSchedule) Karpenter
+      # cannot satisfy a CoreDNS pod at all, so the second replica simply waits,
+      # free of charge, until a hybrid node joins - and then `required` guarantees
+      # it lands on a DIFFERENT host. One replica per location, no burst node.
+      ConfigurationValues: |
+        {
+          "replicaCount": 2,
+          "affinity": {
+            "nodeAffinity": {
+              "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [
+                  {
+                    "matchExpressions": [
+                      {"key": "eks.amazonaws.com/compute-type", "operator": "NotIn", "values": ["hybrid", "fargate"]}
+                    ]
+                  }
+                ]
+              }
+            },
+            "podAntiAffinity": {
+              "preferredDuringSchedulingIgnoredDuringExecution": [
+                {
+                  "weight": 100,
+                  "podAffinityTerm": {
+                    "topologyKey": "kubernetes.io/hostname",
+                    "labelSelector": {"matchExpressions": [{"key": "k8s-app", "operator": "In", "values": ["kube-dns"]}]}
+                  }
+                }
+              ]
+            }
+          },
+          "tolerations": [
+            {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute"},
+            {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute"}
+          ]
+        }
+
+  # ------------------------------------------------------------------ Workshop add-ons
+  PodIdentityAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+
+  CertManagerAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: cert-manager
+      ResolveConflicts: OVERWRITE
+
+  MetricsServerAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: metrics-server
+      ResolveConflicts: OVERWRITE
+
+  # ADOT is intentionally NOT installed in this lab. Page 4.3 teaches the
+  # production dual-export collector as a reference, but deploys no collector and
+  # validates no AMP backfill. Installing the add-on anyway bought no participant
+  # capability and introduced an intermittent cert-manager race: the add-on reports
+  # ACTIVE before cainjector fills the webhook caBundle, so ADOT creation can fail
+  # with x509 unknown authority and roll the whole cluster stack back (~25 min,
+  # measured self-paced E2E 2026-09-08). A plain DependsOn cannot express webhook
+  # readiness. If a future module deploys a real collector, add ADOT back together
+  # with a caBundle readiness gate - never as an unused prerequisite.
+
+  CloudWatchObservabilityAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: amazon-cloudwatch-observability
+      ResolveConflicts: OVERWRITE
+      # Keep the CloudWatch AGENT off hybrid nodes. It needs AWS credentials, and
+      # a hybrid node has no IMDS (this workshop blocks 169.254.169.254 on the VMs
+      # deliberately, because a real data center has no metadata service) and no
+      # Pod Identity (the agent DaemonSet for it excludes compute-type=hybrid). So
+      # the agent starts, fails to authenticate and crash-loops: on event 66489015
+      # it sat in CrashLoopBackOff with 147 restarts for 13 hours, which is the
+      # first thing a participant sees in `kubectl get pods -A`.
+      # The add-on's default affinity only excludes fargate, so hybrid must be
+      # added explicitly. Nothing is lost: node-level Container Insights could
+      # never work on hybrid nodes for the same IMDS reason, and the local
+      # Prometheus stack in module 4 is precisely the answer to that gap. Container
+      # logs (fluent-bit) are a separate DaemonSet and keep running on hybrid nodes.
+      ConfigurationValues: |
+        {
+          "agents": [
+            {
+              "name": "cloudwatch-agent",
+              "affinity": {
+                "nodeAffinity": {
+                  "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [
+                      {
+                        "matchExpressions": [
+                          {
+                            "key": "eks.amazonaws.com/compute-type",
+                            "operator": "NotIn",
+                            "values": ["fargate", "hybrid"]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+
+  NodeExporterAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: prometheus-node-exporter
+      ResolveConflicts: OVERWRITE
+
+  KubeStateMetricsAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: kube-state-metrics
+      ResolveConflicts: OVERWRITE
+
+  # Karpenter runs as a Pod Identity association (no OIDC provider needed)
+  KarpenterPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: kube-system
+      ServiceAccount: karpenter
+      RoleArn: !GetAtt KarpenterControllerRole.Arn
+
+  # ------------------------------------------------------------------ AMP
+  AmpWorkspace:
+    Type: AWS::APS::Workspace
+    Properties:
+      Alias: !Sub '${WorkshopName}-hybrid'
+      Tags: [{Key: workshop, Value: !Ref WorkshopName}]
+
+  # The on-premises Prometheus (module 4) remote_writes to AMP with SigV4, so it
+  # needs AWS credentials - and a hybrid node has NO IMDS to get them from.
+  # EKS Pod Identity is the answer and it works on hybrid nodes (the
+  # eks-pod-identity-agent add-on runs there). Without this the Prometheus pod
+  # crash-loops with "could not get SigV4 credentials: NoCredentialProviders"
+  # and module 4 never comes up (caught in the v5 e2e 2026-08-06).
+  # The association is created up front; the namespace/ServiceAccount appear
+  # later, when the participant applies the module 4 manifest.
+  AmpWriteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: pods.eks.amazonaws.com}
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      Policies:
+        - PolicyName: amp-remote-write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['aps:RemoteWrite', 'aps:GetSeries', 'aps:GetLabels', 'aps:GetMetricMetadata']
+                Resource: !GetAtt AmpWorkspace.Arn
+
+  PrometheusPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref Cluster
+      Namespace: onprem-monitoring
+      ServiceAccount: prometheus
+      RoleArn: !GetAtt AmpWriteRole.Arn
+
+  # Consumed by the asset install step: rendered into the local Prometheus
+  # remote_write config and the amp-remote-write secret (module 4.1 step 3).
+  AmpRemoteWriteUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/amp-remote-write-url'
+      Type: String
+      Value: !Sub '${AmpWorkspace.PrometheusEndpoint}api/v1/remote_write'
+
+  # ------------------------------------------------------------------ Contract for the IDE stack
+  ClusterNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/cluster-name'
+      Type: String
+      Value: !Ref Cluster
+
+  # Published so the EC2NodeClass can select the security group BY ID.
+  # Selecting by tag (aws:eks:cluster-name) is ambiguous: a leftover cluster with
+  # the same name in another VPC gets matched too, and the launch fails with
+  # "Security group and subnet belong to different networks" (hit for real
+  # 2026-08-04). IDs are unambiguous.
+  ClusterSgParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/cluster-security-group'
+      Type: String
+      Value: !GetAtt Cluster.ClusterSecurityGroupId
+
+  KarpenterQueueParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/karpenter-queue'
+      Type: String
+      Value: !GetAtt KarpenterInterruptionQueue.QueueName
+
+  NodeRoleParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/node-role-name'
+      Type: String
+      Value: !Ref NodeRole
+
+  KarpenterVersionParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/karpenter-version'
+      Type: String
+      Value: !Ref KarpenterVersion
+
+  # ==========================================================================
+  # Inference images - CodeBuild bake into the account ECR (was static/eks-hybrid-images.yaml, folded in to stay under the 5-template contentspec limit). The trigger has no dependency on the cluster, so the build starts immediately and runs in the shadow of the cluster creation.
+  # ==========================================================================
+  # Both repositories: KMS encryption with the AWS managed key for ECR (ECR
+  # grants itself access, so the build push and the node pulls need no KMS
+  # permission), and basic scanning on every push.
+  Repo1b:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: eks-hybrid-workshop/ollama-llama32-1b
+      EmptyOnDelete: true
+      EncryptionConfiguration: {EncryptionType: KMS}
+      ImageScanningConfiguration: {ScanOnPush: true}
+      Tags: [{Key: workshop, Value: !Ref WorkshopName}]
+  Repo8b:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: eks-hybrid-workshop/ollama-llama31-8b
+      EmptyOnDelete: true
+      EncryptionConfiguration: {EncryptionType: KMS}
+      ImageScanningConfiguration: {ScanOnPush: true}
+      Tags: [{Key: workshop, Value: !Ref WorkshopName}]
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: build-images
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['ecr:GetAuthorizationToken']
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource:
+                  - !GetAtt Repo1b.Arn
+                  - !GetAtt Repo8b.Arn
+              - Effect: Allow
+                Action: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents']
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${WorkshopName}-images*'
+
+  ImagesProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${WorkshopName}-images'
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 30
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE     # disk + network for multi-GB layers
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true                  # docker build
+        EnvironmentVariables:
+          - {Name: OLLAMA_IMAGE, Value: !Ref OllamaImage}
+          - {Name: LOCAL_REGISTRY, Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'}
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - aws ecr get-login-password | docker login --username AWS --password-stdin "$LOCAL_REGISTRY"
+                - |
+                  cat > Dockerfile <<'EOF'
+                  ARG BASE
+                  FROM ${BASE}
+                  ARG MODEL
+                  # native amd64: ollama runs fine here (crashes only under qemu)
+                  RUN ollama serve & SERVE=$!; sleep 4; ollama pull ${MODEL}; kill $SERVE
+                  EXPOSE 11434
+                  EOF
+            build:
+              commands:
+                - |
+                  set -u
+                  # No fallback image: if anything below fails, the build fails, the
+                  # preflight and the Validation block report the images missing, and
+                  # the fix is to run this build again.
+                  PROJECT="${CODEBUILD_BUILD_ID%%:*}"
+                  publish() {  # tag model
+                    local tag="$1" model="$2" uri="$LOCAL_REGISTRY/eks-hybrid-workshop/$1"
+                    echo "=== $tag: building (base: $OLLAMA_IMAGE, model: registry.ollama.ai)"
+                    if ! docker build --build-arg BASE="$OLLAMA_IMAGE" \
+                                      --build-arg MODEL="$model" -t "$uri:latest" . ; then
+                      echo "=== $tag: BUILD FAILED - nothing pushed. Fix the error above, then run: aws codebuild start-build --project-name $PROJECT"
+                      return 1
+                    fi
+                    echo "=== $tag: smoke test (model must be served)"
+                    docker run -d --name "smoke-$tag" -p 11434 "$uri:latest"
+                    PORT=$(docker port "smoke-$tag" 11434/tcp | head -1 | cut -d: -f2)
+                    ok=0
+                    for i in $(seq 1 12); do
+                      if curl -sf "http://localhost:$PORT/api/tags" | grep -q "$(echo $model | cut -d: -f1)"; then ok=1; break; fi
+                      sleep 5
+                    done
+                    docker rm -f "smoke-$tag" >/dev/null
+                    [ "$ok" = 1 ] || { echo "SMOKE TEST FAILED for $tag"; return 1; }
+                    echo "=== $tag: smoke test PASSED - pushing"
+                    docker push "$uri:latest"
+                  }
+                  # The base comes from Docker Hub, whose anonymous pulls are limited per
+                  # source IP, and CodeBuild hosts share IPs. Pull it once, up front, so a
+                  # rate limit fails here with a message that names the fix. The last
+                  # line is the verdict: the build fails if any image was not published.
+                  rc=0
+                  if docker pull "$OLLAMA_IMAGE"; then
+                    publish ollama-llama32-1b llama3.2:1b || rc=1
+                    publish ollama-llama31-8b llama3.1:8b || rc=1
+                  else
+                    echo "=== BASE IMAGE PULL FAILED for $OLLAMA_IMAGE. If the error above is the Docker Hub pull rate limit (toomanyrequests), wait for the limit window to pass, then run: aws codebuild start-build --project-name $PROJECT"
+                    rc=1
+                  fi
+                  [ "$rc" = 0 ]
+
+  # Fire-and-forget trigger: starts the build and returns immediately so this
+  # stack completes fast and the build overlaps the cluster stack deploy.
+  # Custom resources with packaged code cannot use cfnresponse - inline ZipFile
+  # can, but we keep the urllib respond() pattern used across this workshop.
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: start-build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['codebuild:StartBuild']
+                Resource: !GetAtt ImagesProject.Arn
+
+  TriggerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt TriggerRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3, os
+          def respond(event, context, status, data=None):
+              body = json.dumps({
+                  'Status': status, 'Reason': 'see CloudWatch',
+                  'PhysicalResourceId': event.get('PhysicalResourceId', 'images-build-trigger'),
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'], 'Data': data or {}}).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                                           headers={'content-type': ''})
+              urllib.request.urlopen(req)
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      boto3.client('codebuild').start_build(projectName=os.environ['PROJECT'])
+                  respond(event, context, 'SUCCESS')
+              except Exception as e:
+                  # the build runs after this stack completes, and its outcome is
+                  # checked by preflight-check.sh and the Validation block, so a
+                  # failed trigger never fails the stack
+                  print('trigger error:', e)
+                  respond(event, context, 'SUCCESS', {'warning': str(e)})
+      Environment:
+        Variables: {PROJECT: !Sub '${WorkshopName}-images'}
+
+  BuildTrigger:
+    Type: Custom::StartImagesBuild
+    DependsOn: ImagesProject
+    Properties:
+      ServiceToken: !GetAtt TriggerFn.Arn
+
+  # Contract: consumed by installAssets to render the manifests
+  LocalRegistryParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/inference-registry-local'
+      Type: String
+      Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/eks-hybrid-workshop'
+  # Kept so the parameter contract the IDE reads stays the same. There is no
+  # third-party fallback in this sample: the fallback IS the account's own ECR,
+  # so the manifests always point there and the pods pull once the build lands.
+  FallbackRegistryParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/inference-registry-fallback'
+      Type: String
+      Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/eks-hybrid-workshop'
+
+Outputs:
+  # Participant-visible output (renamed from ClusterNameOut; the export name is
+  # unchanged).
+  LabClusterName:
+    Value: !Ref Cluster
+    Export: {Name: !Sub '${WorkshopName}-cluster-name'}
+  ClusterEndpoint:
+    Value: !GetAtt Cluster.Endpoint
+  HybridNodesRoleName:
+    Description: Bind SSM hybrid activations to this role (content page 2.1)
+    Value: !Ref HybridNodesRole
+  AmpRemoteWriteUrl:
+    Description: remote_write endpoint for the ADOT dual-export pipeline (module 4.3)
+    Value: !Sub '${AmpWorkspace.PrometheusEndpoint}api/v1/remote_write'
+  KarpenterQueueName:
+    Value: !GetAtt KarpenterInterruptionQueue.QueueName
+  LocalRegistry:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/eks-hybrid-workshop'
+  BuildProject:
+    Value: !Ref ImagesProject

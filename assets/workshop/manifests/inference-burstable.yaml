@@ -1,0 +1,101 @@
+# =============================================================================
+# INFERENCE SERVICE (burst-ready variant) - Module 6.2
+#
+# The SAME deployment as inference-onprem.yaml with ONE architectural change:
+# the hard nodeSelector became PREFERRED node affinity. On-premises is home;
+# cloud is overflow. Applying this file over the Module 3 deployment is an
+# in-place update (same name/labels): pods are NOT restarted until you scale.
+#
+# Also removed: topologySpreadConstraints. It was `maxSkew: 1` on hostname, and
+# even as ScheduleAnyway the scheduler scores a fresh host above a second pod on
+# a host that already has one - which beats the preferred affinity and defeats
+# the whole point of this page. Measured on event c813d0f5: WITH the constraint,
+# 10 replicas landed 1 pod per hybrid node and 8 in the cloud across 5 burst
+# nodes; WITHOUT it, 5 stayed on-premises. Node capacity, not spreading, is what
+# should decide when the data center is full.
+#
+# ${INFERENCE_REGISTRY} resolved at provisioning: your account's ECR (images built there by CodeBuild).
+# =============================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference
+  namespace: default
+  labels: {app: inference, tier: onprem-baseline}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: inference}
+  template:
+    metadata:
+      labels: {app: inference}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        nodeAffinity:
+          # The image is built for x86_64 only, and the cloud-baseline node group
+          # is Graviton (AL2023_ARM_64_STANDARD). Since the hybrid preference below
+          # is only a PREFERENCE, nothing stopped the scheduler from placing a
+          # replica on the arm64 node, where the container dies with
+          #   exec /bin/ollama: exec format error
+          # and the participant sees CrashLoopBackOff in module 6 for no reason
+          # they can act on. Whether it happens at all depends on where the
+          # scheduler finds room, which is why it survived several events. A pod
+          # should declare the architecture its image actually supports.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: ["amd64"]
+          preferredDuringSchedulingIgnoredDuringExecution:   # preference, not law
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: eks.amazonaws.com/compute-type
+                    operator: In
+                    values: ["hybrid"]
+      tolerations:
+        # Burst NodePools are tainted workshop-role=burst:NoSchedule so that only
+        # this tier can use cloud burst capacity. Untainted, any pending
+        # kube-system pod was enough for Karpenter to buy a node and keep it.
+        # NOTE: this entry MUST live in this single tolerations block - adding a
+        # second `tolerations:` key to the same mapping silently loses one of
+        # them (YAML keeps the last), which is exactly what happened first try.
+        - {key: workshop-role, operator: Equal, value: burst, effect: NoSchedule}
+        - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute}
+        - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute}
+      containers:
+        - name: ollama
+          image: ${INFERENCE_REGISTRY}/ollama-llama32-1b:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: OLLAMA_NUM_PARALLEL, value: "2"}
+            - {name: OLLAMA_KEEP_ALIVE, value: "-1"}
+          ports:
+            - {containerPort: 11434, name: ollama}
+          resources:
+            requests: {cpu: "1500m", memory: 3Gi}
+          readinessProbe:
+            httpGet: {path: /, port: 11434}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+        - name: metrics-proxy
+          image: public.ecr.aws/docker/library/python:3.12-alpine
+          command: ["python3", "/app/proxy.py"]
+          env:
+            - {name: PARALLEL, value: "2"}
+            - {name: LISTEN_PORT, value: "8080"}
+          ports:
+            - {containerPort: 8080, name: http}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+          volumeMounts:
+            - {name: proxy-code, mountPath: /app}
+      volumes:
+        - name: proxy-code
+          configMap: {name: ollama-metrics-proxy}

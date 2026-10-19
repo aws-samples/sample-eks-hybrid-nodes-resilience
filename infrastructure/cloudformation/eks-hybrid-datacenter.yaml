@@ -1,0 +1,668 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EKS Hybrid Nodes Workshop - the simulated on-premises Data Center: its own VPC,
+  a Transit Gateway hub, a Site-to-Site VPN terminated on a VPN appliance,
+  and the routing that makes the remote node/pod CIDRs reachable both ways.
+
+# ============================================================================
+# WHY A SEPARATE STACK (and not the old provisioning/cfn/network.yaml)
+# network.yaml created its OWN EKS VPC, duplicating the already-validated
+# network-bootstrap stack. This one is ADDITIVE: it reads the EKS VPC, subnets
+# and route table from the SSM contract, so it can deploy IN PARALLEL with the
+# cluster (it has zero dependency on the cluster itself).
+#
+# ROUTING DESIGN (the part that makes or breaks hybrid nodes)
+#
+#   EKS VPC (10.42.0.0/16)                    DC VPC (10.90.0.0/16)
+#   ├── routes 10.80.0.0/16 -> TGW            ├── public subnet: libreswan (EIP)
+#   └── routes 10.85.0.0/16 -> TGW            └── private subnet: Hyper-V host
+#            |                                        │ (source/dest check OFF)
+#           TGW ══ Site-to-Site VPN ══ libreswan     │
+#                  (static: 10.80/16, 10.85/16)       │
+#                                                     ▼
+#                                    Hyper-V internal net 10.80.0.0/16
+#                                    (Windows host FORWARDS, does NOT NAT
+#                                     the workshop CIDRs - inbound must work:
+#                                     control-plane -> kubelet:10250, and
+#                                     cloud pod -> hybrid pod. NAT kills both.)
+#
+#   - VM internet egress: default route -> libreswan (iptables MASQUERADE)
+#   - VPN-bound (10.42/16): libreswan routes over IPsec, never NATted
+#   - DC private subnet routes 10.80/16 + 10.85/16 -> Hyper-V host ENI
+# ============================================================================
+
+Parameters:
+  WorkshopName:
+    Type: String
+    Default: eks-hybrid
+  EksVpcId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/vpc-1-id
+  EksSubnetIds:
+    Type: AWS::SSM::Parameter::Value<List<String>>
+    Default: /workshop/eks-hybrid/cluster-subnets
+  EksRouteTableId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/vpc-1-route-table
+  EksVpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+  DcVpcCidr:
+    Type: String
+    Default: 10.90.0.0/16
+  RemoteNodeCidr:
+    Type: String
+    Default: 10.80.0.0/16
+  RemotePodCidr:
+    Type: String
+    Default: 10.85.0.0/16
+  LatestAlAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  # ---- merged from eks-hybrid-fis.yaml
+  SubnetA:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/public-subnet-1a
+  SubnetB:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/public-subnet-1b
+
+Resources:
+  # ------------------------------------------------------------------ DC VPC
+  DcVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref DcVpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: 'On-Premises DataCenter - network'}]
+  DcPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DcVpc
+      CidrBlock: 10.90.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: 'On-Premises DataCenter - DMZ (VPN appliance)'}]
+  DcPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DcVpc
+      CidrBlock: 10.90.1.0/24
+      # Keep the capacity-heavy nested-virtualization host off the first AZ.
+      # A fresh event failed with InsufficientInstanceCapacity for m8i.4xlarge
+      # in us-east-1a while EC2 explicitly reported capacity in 1b/1c/1d/1f.
+      # Index 1 offers m8i.4xlarge in every supported workshop region
+      # (us-east-1, us-east-2, us-west-2). The VPN appliance can remain in
+      # index 0; VPC routing connects the public and private subnets cross-AZ.
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{Key: Name, Value: 'On-Premises DataCenter - server room (Hyper-V host)'}]
+  DcIgw: {Type: AWS::EC2::InternetGateway}
+  DcIgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref DcVpc, InternetGatewayId: !Ref DcIgw}
+
+  DcPublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref DcVpc, Tags: [{Key: Name, Value: !Sub '${WorkshopName}-dc-pub'}]}
+  DcPublicDefault:
+    Type: AWS::EC2::Route
+    DependsOn: DcIgwAttach
+    Properties: {RouteTableId: !Ref DcPublicRt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref DcIgw}
+  DcPubRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref DcPublicSubnet, RouteTableId: !Ref DcPublicRt}
+
+  # Private subnet (Hyper-V host): default via libreswan (MASQUERADE for internet,
+  # IPsec for the EKS VPC). Workshop CIDRs route back to the Hyper-V host ENI -
+  # added by the hyperv host stack, which owns that ENI.
+  DcPrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref DcVpc, Tags: [{Key: Name, Value: !Sub '${WorkshopName}-dc-priv'}]}
+  DcPrivDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref DcPrivateRt
+      DestinationCidrBlock: 0.0.0.0/0
+      NetworkInterfaceId: !Ref VpnApplianceEni
+  DcPrivRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref DcPrivateSubnet, RouteTableId: !Ref DcPrivateRt}
+
+  # ------------------------------------------------------------------ TGW + VPN
+  Tgw:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      Description: !Sub '${WorkshopName} hub'
+      AmazonSideAsn: 64512
+      DefaultRouteTableAssociation: enable
+      DefaultRouteTablePropagation: enable
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-tgw'}]
+  TgwAttachEks:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      TransitGatewayId: !Ref Tgw
+      VpcId: !Ref EksVpcId
+      SubnetIds: !Ref EksSubnetIds
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-eks-attach'}]
+
+  # EKS VPC -> on-prem CIDRs via the TGW (the return path for kubelet:10250
+  # and for cloud-pod -> hybrid-pod traffic)
+  EksToRemoteNodes:
+    Type: AWS::EC2::Route
+    DependsOn: TgwAttachEks
+    Properties:
+      RouteTableId: !Ref EksRouteTableId
+      DestinationCidrBlock: !Ref RemoteNodeCidr
+      TransitGatewayId: !Ref Tgw
+  # There is deliberately NO route here for the remote POD CIDR.
+  # The EKS Hybrid Nodes gateway owns that route: it points the pod CIDR at
+  # whichever gateway instance holds the leader lease, and rewrites it on
+  # failover. Creating it here as well is not redundant, it is a COLLISION -
+  # the code editor stack installs the gateway before this stack runs, so
+  # CloudFormation found the route already present and failed the whole
+  # deployment with:
+  #   The route identified by 10.85.0.0/16 already exists. (AlreadyExists)
+  # That took down event 94eb83ef. The division of labour is the one described
+  # on page 1.1: the NODE network is routed the classic way over the VPN and
+  # Transit Gateway - which is what carries the gateway's own VXLAN traffic -
+  # and pod reachability FROM the VPC belongs to the gateway.
+
+  VpnApplianceEip: {Type: AWS::EC2::EIP, Properties: {Domain: vpc}}
+  Cgw:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      Type: ipsec.1
+      IpAddress: !Ref VpnApplianceEip
+      BgpAsn: 65000
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-cgw'}]
+  Vpn:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      TransitGatewayId: !Ref Tgw
+      CustomerGatewayId: !Ref Cgw
+      StaticRoutesOnly: true
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-vpn'}]
+
+  # ------------------------------------------------- libreswan VPN appliance
+  VpnApplianceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: libreswan VPN appliance
+      VpcId: !Ref DcVpc
+      SecurityGroupIngress:
+        - {IpProtocol: udp, FromPort: 500, ToPort: 500, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: udp, FromPort: 4500, ToPort: 4500, CidrIp: 0.0.0.0/0}
+        - {IpProtocol: '-1', CidrIp: !Ref DcVpcCidr}
+        - {IpProtocol: '-1', CidrIp: !Ref RemoteNodeCidr}
+        - {IpProtocol: '-1', CidrIp: !Ref RemotePodCidr}
+        - {IpProtocol: '-1', CidrIp: !Ref EksVpcCidr}
+      # Stated explicitly rather than left to the implicit default (same rule):
+      # the appliance originates IPsec to the two AWS tunnel endpoints, whose
+      # outside IPs exist only after the VPN does, and it is the data center's
+      # NAT gateway to the internet, so its egress is open by design.
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0, Description: 'IPsec to the AWS VPN endpoints and NAT egress for the data center'}
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-vpn-sg'}]
+
+  VpnApplianceEni:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref DcPublicSubnet
+      GroupSet: [!Ref VpnApplianceSg]
+      SourceDestCheck: false
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-vpn-eni'}]
+
+  VpnApplianceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: read-vpn-config
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['ec2:DescribeVpnConnections'], Resource: '*'}
+  VpnApplianceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref VpnApplianceRole]}
+
+  VpnAppliance:
+    Type: AWS::EC2::Instance
+    Properties:
+      MetadataOptions:
+        # Explicit, not inherited. AL2023 already ships imds-support v2.0, so the
+        # running instances measured as HttpTokens=required before this was added -
+        # but that is an AMI DEFAULT, and a future AMI or a copied template silently
+        # loses it. Declaring it makes IMDSv2 a property of the workshop rather than
+        # of the image. Verified live on event a135e903: every IMDS call in the
+        # bootstrap already sends the token header, IMDSv1 returns 401, and kubectl,
+        # the IDE credentials, code-server and both VPN tunnels stayed healthy.
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      ImageId: !Ref LatestAlAmi
+      InstanceType: t3.small
+      IamInstanceProfile: !Ref VpnApplianceProfile
+      # Root volume encrypted explicitly (the account's default EBS key), not only
+      # when the account turned EBS encryption by default on. Size and type follow
+      # the AMI.
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {Encrypted: true, DeleteOnTermination: true}
+      NetworkInterfaces:
+        - {NetworkInterfaceId: !Ref VpnApplianceEni, DeviceIndex: '0'}
+      Tags:
+        - {Key: Name, Value: 'On-Premises DataCenter - VPN appliance (libreswan)'}
+        - {Key: workshop-role, Value: vpn-appliance}
+  VpnApplianceEipAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt VpnApplianceEip.AllocationId
+      NetworkInterfaceId: !Ref VpnApplianceEni
+
+  # libreswan configuration: renders ipsec.conf from the VPN tunnel details
+  # (PSK + outside IPs via DescribeVpnConnections) and sets forwarding/NAT.
+  # State Manager keeps it applied (self-healing after a reboot).
+  VpnApplianceSetupDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${WorkshopName}-vpn-setup'
+      DocumentType: Command
+      DocumentFormat: YAML
+      UpdateMethod: NewVersion
+      TargetType: /AWS::EC2::Instance
+      Content:
+        schemaVersion: '2.2'
+        description: Configure the libreswan VPN appliance for the workshop DC
+        parameters:
+          VpnConnectionId: {type: String}
+          EksVpcCidrParam: {type: String, default: 10.42.0.0/16}
+          RemoteNodeCidrParam: {type: String, default: 10.80.0.0/16}
+          RemotePodCidrParam: {type: String, default: 10.85.0.0/16}
+          DcVpcCidrParam: {type: String, default: 10.90.0.0/16}
+        mainSteps:
+          - action: aws:runShellScript
+            name: configureVpnAppliance
+            inputs:
+              timeoutSeconds: '900'
+              runCommand:
+                - |
+                  set -uxo pipefail
+                  # libreswan, NOT strongswan: it is the only IPsec stack in the
+                  # AL2023 repos (validated 2026-08-06). iptables-nft provides the
+                  # iptables command (AL2023 ships nftables only).
+                  dnf install -y libreswan iptables-nft python3 >/dev/null 2>&1
+                  export PATH=$PATH:/usr/sbin:/sbin
+                  TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                  REGION=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+                  aws ec2 describe-vpn-connections --vpn-connection-ids {{ VpnConnectionId }} --region "$REGION" \
+                    --query 'VpnConnections[0].CustomerGatewayConfiguration' --output text > /tmp/vpn.xml
+                  #
+                  # ROUTE-BASED (VTI), not policy-based. A Transit Gateway VPN
+                  # negotiates 0.0.0.0/0 traffic selectors, so per-subnet policy
+                  # pairs mostly fail to establish: in the v5 e2e only the
+                  # 10.90<->10.42 SA came up and every cloud->VM packet blackholed
+                  # while the tunnels showed UP. With VTI there is ONE SA per
+                  # tunnel and plain IP routing decides what enters it.
+                  EKS_CIDR="{{ EksVpcCidrParam }}" python3 - <<'PY'
+                  import os, xml.etree.ElementTree as ET
+                  root = ET.parse('/tmp/vpn.xml').getroot()
+                  conns, secrets, vtis = [], [], []
+                  for i, t in enumerate(root.findall('.//ipsec_tunnel'), 1):
+                      cgw_out = t.find('.//customer_gateway/tunnel_outside_address/ip_address').text
+                      cgw_in  = t.find('.//customer_gateway/tunnel_inside_address/ip_address').text
+                      cgw_nm  = t.find('.//customer_gateway/tunnel_inside_address/network_cidr').text
+                      aws_out = t.find('.//vpn_gateway/tunnel_outside_address/ip_address').text
+                      aws_in  = t.find('.//vpn_gateway/tunnel_inside_address/ip_address').text
+                      psk     = t.find('.//ike/pre_shared_key').text
+                      mark = 100 + i
+                      conns.append(f"""conn aws-tunnel-{i}
+                          auto=start
+                          left=%defaultroute
+                          leftid={cgw_out}
+                          right={aws_out}
+                          rightid=%any
+                          leftsubnet=0.0.0.0/0
+                          rightsubnet=0.0.0.0/0
+                          type=tunnel
+                          authby=secret
+                          ikev2=insist
+                          ike=aes256-sha2_256;modp2048
+                          esp=aes256-sha2_256
+                          pfs=yes
+                          dpddelay=10
+                          dpdtimeout=30
+                          dpdaction=restart
+                          encapsulation=yes
+                          mark={mark}/0xffffffff
+                          vti-interface=vti{i}
+                          vti-routing=no
+                      """)
+                      secrets.append(f'{cgw_out} {aws_out} : PSK "{psk}"')
+                      vtis.append(f'{i} {mark} {cgw_in}/{cgw_nm} {aws_in} {aws_out}')
+                  open('/etc/ipsec.d/aws-vpn.conf','w').write('\n'.join(conns))
+                  open('/etc/ipsec.d/aws-vpn.secrets','w').write('\n'.join(secrets)+'\n')
+                  open('/tmp/vti-plan','w').write('\n'.join(vtis)+'\n')
+                  print(f"rendered {len(secrets)} VTI tunnels")
+                  PY
+                  chmod 600 /etc/ipsec.d/aws-vpn.secrets
+                  # forwarding; rp_filter off (asymmetric paths are normal here)
+                  cat > /etc/sysctl.d/99-vpn.conf <<'SYSCTL'
+                  net.ipv4.ip_forward=1
+                  net.ipv4.conf.all.rp_filter=0
+                  net.ipv4.conf.default.rp_filter=0
+                  net.ipv4.conf.all.send_redirects=0
+                  net.ipv4.conf.default.send_redirects=0
+                  SYSCTL
+                  sysctl -p /etc/sysctl.d/99-vpn.conf >/dev/null
+                  # MASQUERADE only for internet-bound traffic: anything heading to
+                  # the EKS VPC crosses IPsec untouched, because the control plane
+                  # must see the REAL node/pod IPs (NAT breaks kubelet registration
+                  # and pod-to-pod).
+                  for cidr in {{ RemoteNodeCidrParam }} {{ RemotePodCidrParam }} {{ DcVpcCidrParam }}; do
+                    iptables -t nat -C POSTROUTING -s "$cidr" ! -d "{{ EksVpcCidrParam }}" -j MASQUERADE 2>/dev/null || \
+                      iptables -t nat -A POSTROUTING -s "$cidr" ! -d "{{ EksVpcCidrParam }}" -j MASQUERADE
+                  done
+                  systemctl enable ipsec >/dev/null 2>&1
+                  systemctl restart ipsec
+                  sleep 25
+                  # bring the VTI interfaces up and route the EKS CIDR into them.
+                  # libreswan creates vtiN; the addressing/routing is ours.
+                  while read -r idx mark inside peer_inside peer_out; do
+                    [ -z "${idx:-}" ] && continue
+                    ip link show "vti${idx}" >/dev/null 2>&1 || \
+                      ip link add "vti${idx}" type vti local "$(hostname -I | awk '{print $1}')" remote "$peer_out" key "$mark"
+                    ip addr replace "$inside" dev "vti${idx}" 2>/dev/null
+                    ip link set "vti${idx}" up mtu 1436
+                    sysctl -w "net.ipv4.conf.vti${idx}.disable_policy=1" >/dev/null 2>&1
+                    sysctl -w "net.ipv4.conf.vti${idx}.rp_filter=0" >/dev/null 2>&1
+                  done < /tmp/vti-plan
+                  # EKS VPC via tunnel 1, tunnel 2 as backup (AWS keeps one active)
+                  ip route replace "{{ EksVpcCidrParam }}" dev vti1 metric 100 2>/dev/null
+                  ip route add "{{ EksVpcCidrParam }}" dev vti2 metric 200 2>/dev/null || true
+                  ip link show vti1 2>&1 | head -2
+                  ip route get 10.42.0.10 2>&1 | head -2
+                  ipsec status 2>&1 | grep -cE "IPsec SA established|erouted"
+                  echo VPN_APPLIANCE_OK
+
+  VpnApplianceAssociation:
+    Type: AWS::SSM::Association
+    DependsOn: [VpnAppliance, Vpn]
+    Properties:
+      AssociationName: !Sub '${WorkshopName}-vpn-setup'
+      Name: !Ref VpnApplianceSetupDoc
+      Targets:
+        - Key: tag:workshop-role
+          Values: [vpn-appliance]
+      Parameters:
+        VpnConnectionId: [!Ref Vpn]
+        EksVpcCidrParam: [!Ref EksVpcCidr]
+        RemoteNodeCidrParam: [!Ref RemoteNodeCidr]
+        RemotePodCidrParam: [!Ref RemotePodCidr]
+        DcVpcCidrParam: [!Ref DcVpcCidr]
+      ScheduleExpression: 'rate(30 minutes)'
+
+  # --------------------------- VPN attachment discovery + TGW static routes
+  # The TGW VPN attachment id only exists post-creation, so the static routes
+  # for the on-prem CIDRs (pointing at the VPN attachment) need a custom
+  # resource. cfnresponse does NOT exist in python3.13 - own respond() below.
+  VpnDetailsFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+        - PolicyName: tgw-routes
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Describe* has no resource-level support
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeTransitGatewayAttachments
+                  - ec2:DescribeTransitGatewayRouteTables
+                Resource: '*'
+              # route writes scoped to this region/account's TGW resources
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTransitGatewayRoute
+                  - ec2:DeleteTransitGatewayRoute
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:transit-gateway-route-table/*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:transit-gateway-attachment/*'
+  VpnDetailsFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt VpnDetailsFnRole.Arn
+      Code:
+        ZipFile: |
+          import json, time, urllib.request, boto3
+          def respond(event, ctx, status, data=None, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f"see CloudWatch log stream {ctx.log_stream_name}",
+                  'PhysicalResourceId': event.get('PhysicalResourceId') or ctx.log_stream_name,
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}}).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                                           headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req)
+          def handler(event, ctx):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      return respond(event, ctx, 'SUCCESS')
+                  p = event['ResourceProperties']
+                  ec2 = boto3.client('ec2')
+                  # the VPN attachment appears a few seconds after the VPN itself
+                  att = None
+                  for _ in range(30):
+                      r = ec2.describe_transit_gateway_attachments(Filters=[
+                          {'Name': 'resource-id', 'Values': [p['VpnId']]},
+                          {'Name': 'resource-type', 'Values': ['vpn']}])['TransitGatewayAttachments']
+                      if r and r[0]['State'] in ('available', 'pending'):
+                          att = r[0]; break
+                      time.sleep(10)
+                  if not att:
+                      raise RuntimeError('VPN transit gateway attachment not found')
+                  rt = ec2.describe_transit_gateway_route_tables(Filters=[
+                      {'Name': 'default-association-route-table', 'Values': ['true']},
+                      {'Name': 'transit-gateway-id', 'Values': [p['TgwId']]}])['TransitGatewayRouteTables'][0]
+                  for cidr in (p['RemoteNodeCidr'], p['RemotePodCidr']):
+                      try:
+                          ec2.create_transit_gateway_route(
+                              DestinationCidrBlock=cidr,
+                              TransitGatewayRouteTableId=rt['TransitGatewayRouteTableId'],
+                              TransitGatewayAttachmentId=att['TransitGatewayAttachmentId'])
+                      except ec2.exceptions.ClientError as e:
+                          if 'RouteAlreadyExists' not in str(e) and 'DuplicateRoute' not in str(e):
+                              raise
+                  respond(event, ctx, 'SUCCESS', {'VpnAttachmentId': att['TransitGatewayAttachmentId']})
+              except Exception as e:
+                  respond(event, ctx, 'FAILED', reason=str(e))
+  VpnDetails:
+    Type: Custom::VpnDetails
+    DependsOn: Vpn
+    Properties:
+      ServiceToken: !GetAtt VpnDetailsFn.Arn
+      VpnId: !Ref Vpn
+      TgwId: !Ref Tgw
+      RemoteNodeCidr: !Ref RemoteNodeCidr
+      RemotePodCidr: !Ref RemotePodCidr
+
+  # ---------------------------------- Contract consumed by the Hyper-V stack
+  DcVpcParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/dc-vpc-id'
+      Type: String
+      Value: !Ref DcVpc
+  # The IDE (code-server) lives in this subnet since the on-prem-operator
+  # redesign: the participant's terminal sits INSIDE the data center, so during
+  # the module 5 faults they keep SSH to the nodes, the MetalLB VIPs and
+  # Grafana - they ARE the local operator the workshop keeps talking about.
+  # Physics validated live on event a6bbba5e before the change: with FIS
+  # active, from this subnet - kubectl 200, SSH to both nodes OK, inference
+  # VIP 200 in 3ms, Grafana 200 in 6ms; from the old IDE subnet all of it dead.
+  DcDmzSubnetParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/dc-dmz-subnet'
+      Type: String
+      Value: !Ref DcPublicSubnet
+  DcPrivateSubnetParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/dc-private-subnet'
+      Type: String
+      Value: !Ref DcPrivateSubnet
+  DcPrivateRtParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/dc-private-route-table'
+      Type: String
+      Value: !Ref DcPrivateRt
+  # The VPN appliance lives in the PUBLIC subnet. When it decapsulates a packet
+  # from the tunnel destined to a VM (10.80/16) or a pod (10.85/16) it consults
+  # its own routing table -> default -> the VPC router -> THIS route table.
+  # Without the CIDR routes here the packet dies at the VPC router and the
+  # cloud->on-prem path silently blackholes (found in the v5 e2e 2026-08-06:
+  # tunnels UP, TGW routes active, and SSH from the IDE still timed out).
+  DcPublicRtParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/dc-public-route-table'
+      Type: String
+      Value: !Ref DcPublicRt
+
+  # ==========================================================================
+  # AWS FIS - WAN failure drill (was static/eks-hybrid-fis.yaml, folded in to stay under the 5-template contentspec limit)
+  # ==========================================================================
+  # The on-premises networks, as a managed prefix list. This is what the
+  # experiment denies - and it is also a nice teaching artifact: participants
+  # can open it and see exactly which CIDRs the "WAN" carries.
+  OnPremPrefixList:
+    Type: AWS::EC2::PrefixList
+    Properties:
+      PrefixListName: !Sub '${WorkshopName}-onprem-networks'
+      AddressFamily: IPv4
+      MaxEntries: 4
+      Entries:
+        - {Cidr: !Ref RemoteNodeCidr, Description: remote node network}
+        - {Cidr: !Ref RemotePodCidr, Description: remote pod network}
+      Tags:
+        - {Key: Name, Value: !Sub '${WorkshopName}-onprem-networks'}
+        - {Key: workshop, Value: !Ref WorkshopName}
+
+  FisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: fis.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: network-disrupt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # read-only discovery: Describe*/Get* have no resource-level support
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkAcls
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeManagedPrefixLists
+                  - ec2:GetManagedPrefixListEntries
+                Resource: '*'
+              # aws:network:disrupt-connectivity works by cloning the subnet's
+              # NACL, adding deny rules and swapping the association - then
+              # reverting when the duration expires. Scoped to THIS region and
+              # account (the API has no tighter resource scope for CreateNetworkAcl).
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkAcl
+                  - ec2:CreateNetworkAclEntry
+                  - ec2:DeleteNetworkAcl
+                  - ec2:DeleteNetworkAclEntry
+                  - ec2:ReplaceNetworkAclAssociation
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-acl/*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/*'
+              - Effect: Allow
+                Action: ['logs:CreateLogDelivery', 'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies', 'logs:DescribeLogGroups']
+                Resource: '*'
+
+  FisLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/fis/${WorkshopName}'
+      RetentionInDays: 7
+
+  DataPathExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: 'Workshop: disrupt EKS VPC <-> on-premises connectivity (WAN failure simulation)'
+      RoleArn: !GetAtt FisRole.Arn
+      Tags:
+        # Deliberately !Ref WorkshopName (= eks-hybrid), like every other resource
+        # this stack creates. Two tag namespaces coexist in this workshop, and the
+        # distinction matters: MANAGED INSTANCES carry workshop=eks-hybrid-nodes
+        # (set by create-activation in module 2, queried by the SSM shortcuts on
+        # pages 5.2/5.5), while CLOUDFORMATION resources carry workshop=eks-hybrid,
+        # which is what preflight-check.sh queries to find this very template.
+        # Pinning this to eks-hybrid-nodes to match a stale content query would
+        # break that preflight check - the same regression that was fixed there
+        # once already, inverted. The content query is the side that was wrong.
+        workshop: !Ref WorkshopName
+        Name: !Sub '${WorkshopName}-datapath-disrupt'
+      StopConditions:
+        - Source: none
+      LogConfiguration:
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt FisLogGroup.Arn
+        LogSchemaVersion: 2
+      Targets:
+        EksSubnets:
+          ResourceType: aws:ec2:subnet
+          ResourceArns:
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${SubnetA}'
+            - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${SubnetB}'
+          SelectionMode: ALL
+      Actions:
+        DisruptToOnPrem:
+          ActionId: aws:network:disrupt-connectivity
+          Description: Deny traffic between the EKS subnets and the on-premises networks
+          Parameters:
+            duration: PT60M
+            scope: prefix-list
+            prefixListIdentifier: !Ref OnPremPrefixList
+          Targets:
+            Subnets: EksSubnets
+
+Outputs:
+  DcVpcId: {Value: !Ref DcVpc}
+  DcPrivateSubnetId: {Value: !Ref DcPrivateSubnet}
+  DcPrivateRouteTableId: {Value: !Ref DcPrivateRt}
+  TgwId: {Value: !Ref Tgw}
+  VpnId: {Value: !Ref Vpn}
+  VpnApplianceInstanceId: {Value: !Ref VpnAppliance}
+  VpnAppliancePublicIp: {Value: !Ref VpnApplianceEip}
+  ExperimentTemplateId:
+    Value: !Ref DataPathExperiment
+  OnPremPrefixListId:
+    Value: !Ref OnPremPrefixList

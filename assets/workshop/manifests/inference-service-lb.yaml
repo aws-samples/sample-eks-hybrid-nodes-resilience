@@ -1,0 +1,40 @@
+# =============================================================================
+# ON-PREMISES INGRESS (MetalLB VIP) - Module 3.1 Step 2
+#
+# Exposes the inference service on the DATA CENTER network (10.80.1.240).
+# MetalLB (pre-installed at provisioning, L2 mode) answers ARP for the VIP from
+# the hybrid nodes themselves - so local clients keep reaching the workload
+# even when AWS is unreachable. This is the disconnection-proof ingress the
+# content contrasts against cloud load balancers.
+#
+# The IPAddressPool/L2Advertisement for 10.80.1.240-10.80.1.250 are created at
+# provisioning (clusterBootstrap) together with MetalLB itself.
+# =============================================================================
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-lb
+  namespace: default
+  labels: {app: inference}
+  annotations:
+    metallb.io/loadBalancerIPs: 10.80.1.240   # fixed VIP - the content and the traffic-generator reference it
+    # CRITICAL in a hybrid EKS cluster. Without this annotation the in-tree AWS
+    # cloud provider also claims the Service and creates an INTERNET-FACING
+    # Classic Load Balancer for it - defeating the disconnection-proof design and
+    # publishing the workload to the internet (observed during testing on
+    # 2026-08-07). Setting the type to "external" makes the in-tree provider
+    # skip the Service; the AWS Load Balancer Controller is not installed in this
+    # cluster, so nothing in AWS picks it up and MetalLB owns it alone.
+    # NOTE: do NOT use spec.loadBalancerClass for this - MetalLB ignores classed
+    # Services unless its controller is started with a matching --lb-class, so
+    # the address just stays <pending> (verified 2026-08-07).
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+spec:
+  type: LoadBalancer
+  selector: {app: inference}
+  ports:
+    - {name: http, port: 80, targetPort: 8080}
+  # keep answering from local pods only: the VIP is announced by nodes that
+  # actually run an inference pod, and traffic never hairpins across the WAN
+  externalTrafficPolicy: Local
