@@ -1,25 +1,56 @@
 # Amazon EKS Hybrid Nodes: On-Premises Resilience and GPU Cloud Bursting
 
-CloudFormation templates, Kubernetes manifests and lab assets for extending an Amazon EKS cluster
-into a simulated on-premises data center, proving workloads survive network failures and control
-plane disconnection, and bursting inference capacity to cloud GPUs with Karpenter.
+Build one Amazon EKS cluster across AWS and a simulated on-premises data center. Test workload
+survival during network isolation, then burst inference capacity to cloud CPU and GPU nodes with
+Karpenter.
 
-**Amazon EKS Hybrid Nodes · Site-to-Site VPN · Transit Gateway · Hyper-V nested virtualization · Cilium · Karpenter · AWS FIS**
+[![Amazon EKS](https://img.shields.io/badge/Amazon%20EKS-Hybrid%20Nodes-FF9900?logo=amazon-eks&logoColor=white)](https://aws.amazon.com/eks/)
+[![Infrastructure](https://img.shields.io/badge/Infrastructure-AWS%20CloudFormation-759C3E)](infrastructure/cloudformation/)
+[![Validation](https://img.shields.io/badge/Live%20validation-Passed-1D8102)](#validation-status)
+[![License](https://img.shields.io/badge/License-MIT--0-232F3E)](LICENSE)
 
-> **This is sample code, for non-production usage.** You should work with your security and legal
-> teams to meet your organizational security, regulatory and compliance requirements before
-> deployment. The environment ships **demo-grade defaults** that are deliberate teaching choices,
-> not recommendations: read [Security and Hardening](#security-and-hardening) before you reuse any
-> of it.
+<p align="center">
+  <img src="docs/images/lab-architecture.png" alt="Amazon EKS control plane connected through Transit Gateway and Site-to-Site VPN to a simulated data center with a Hyper-V host and two hybrid node virtual machines" width="100%">
+</p>
 
-### There is a workshop that walks through this code
+## Lab at a Glance
 
-This repository is the **code**. The guided, step-by-step content lives in a separate workshop,
-*Amazon EKS Hybrid Nodes: On-Premises Resilience and GPU Cloud Bursting*, which walks the modules
-in order and explains the reasoning behind each step. This repository is what its self-paced route
-clones and deploys.
+| | |
+|---|---|
+| **Architecture** | One EKS control plane, cloud nodes, two hybrid node VMs, Transit Gateway, Site-to-Site VPN and a browser IDE |
+| **Resilience** | Validate on-premises inference while the data center is isolated from the EKS control plane |
+| **Cloud bursting** | Scale the same workload to Karpenter-managed CPU and GPU capacity in AWS |
+| **Deployment** | Five CloudFormation stacks in a fixed dependency order |
+| **Tested Region** | `us-east-1` |
+| **Typical lab window** | About 4 hours after deployment |
+| **Estimated idle cost** | About USD 2.27 per hour in `us-east-1`, plus usage-based services |
 
-## Table of Contents
+## Choose Your Path
+
+| I want to... | Start here |
+|---|---|
+| Understand the architecture and failure model | [Overview](#overview) and [What You Will Build](#what-you-will-build) |
+| Deploy the complete environment | [Prerequisites](#prerequisites), then [Getting Started](#getting-started) |
+| Estimate spend before deploying | [Cost](#cost) |
+| Remove every lab resource | [Cleanup](#cleanup) |
+| Diagnose a failed deployment | [Troubleshooting](#troubleshooting) |
+| Reuse the design beyond a lab | [Security and Hardening](#security-and-hardening) and [Known Limitations](#known-limitations) |
+
+> [!CAUTION]
+> **This is sample code for non-production use.** Deploy it only in a dedicated, non-production
+> account. The environment contains deliberate teaching defaults that are not production
+> recommendations. Review [Security and Hardening](#security-and-hardening), understand the
+> [cost](#cost), and run [cleanup](#cleanup) when you finish.
+
+## Guided Workshop
+
+This repository contains the deployable code and assets. The guided workshop,
+*Amazon EKS Hybrid Nodes: On-Premises Resilience and GPU Cloud Bursting*, explains the architecture,
+modules and operational decisions step by step. Its self-paced route clones this repository and
+uses the same participant assets as an AWS-hosted event.
+
+<details>
+<summary><strong>Full table of contents</strong></summary>
 
 - [Overview](#overview)
 - [What You Will Build](#what-you-will-build)
@@ -30,9 +61,12 @@ clones and deploys.
 - [Troubleshooting](#troubleshooting)
 - [Known Limitations](#known-limitations)
 - [Security and Hardening](#security-and-hardening)
+- [Validation Status](#validation-status)
 - [Third-party components](#third-party-components)
 - [Contributing](#contributing)
 - [License](#license)
+
+</details>
 
 ## Overview
 
@@ -57,12 +91,11 @@ Everything runs in a single AWS account, in a single Region.
 
 ## What You Will Build
 
-![EKS Hybrid Nodes lab architecture: an EKS control plane in AWS connected over Transit Gateway and Site-to-Site VPN to a simulated data center, where an EC2 Hyper-V host runs two Ubuntu VMs as hybrid nodes; inside the EKS VPC, the Hybrid Nodes Gateway runs Cilium VTEP on two EC2 cloud nodes and builds a VXLAN tunnel so cloud pods reach on-premises pods](docs/images/lab-architecture.png)
+The architecture above extends one managed EKS control plane into a simulated data center over
+Site-to-Site VPN and Transit Gateway. A Cilium VXLAN data path connects cloud pods to on-premises
+pods while Amazon Managed Service for Prometheus receives metrics from the remote environment.
 
-*Figure 1: One EKS control plane extended into a simulated data center over Site-to-Site VPN and
-Transit Gateway.*
-
-Five CloudFormation stacks, deployed in order. Each one publishes SSM parameters under
+Five CloudFormation stacks are deployed in order. Each one publishes SSM parameters under
 `/workshop/eks-hybrid/` that the next one reads.
 
 | # | Stack | Template | Creates |
@@ -555,6 +588,25 @@ While the stacks exist, these endpoints are reachable from the internet:
 
 None of this is a substitute for your own review. Run your own scanners and threat model against
 anything you carry from here into an account that matters.
+
+## Validation Status
+
+The complete self-paced path was validated in a dedicated non-production account in `us-east-1`.
+The validation covered the participant experience, not only CloudFormation completion.
+
+| Validation area | Result |
+|---|---|
+| CloudFormation | All five stacks reached `CREATE_COMPLETE` in dependency order |
+| Hybrid connectivity | Both Site-to-Site VPN tunnels reached `UP` |
+| Hybrid nodes | Both nested Ubuntu VMs accepted independent key-based SSH probes |
+| Participant path | The browser IDE, workshop assets and complete preflight block passed |
+| Inference images | Both account-local ECR images completed successfully |
+| Cleanup | All run-scoped resources and the validation bootstrap were removed |
+| Security review | No unresolved CRITICAL or HIGH finding in the final candidate |
+
+The validation is a measured reference for this version of the sample. AWS capacity, quotas,
+upstream registries and service behavior can change. Run the preflight checks in your own account
+and keep [Cleanup](#cleanup) ready before starting the lab.
 
 If you discover a potential security issue, follow the process in
 [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications) rather than opening a public issue.
