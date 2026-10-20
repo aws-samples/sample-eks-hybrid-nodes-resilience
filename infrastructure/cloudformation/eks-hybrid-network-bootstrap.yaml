@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EKS Hybrid Nodes Workshop - Minimal network bootstrap for the code-editor
+  provisioning TEST. Creates a VPC + 2 public subnets and publishes their IDs
+  to SSM Parameter Store using the SAME parameter contract the code-editor
+  template consumes (/workshop/<name>/...). In the full workshop this role is
+  played by network.yaml. Keeping the contract identical means the code-editor
+  template needs no change to run on it.
+
+Parameters:
+  WorkshopName:
+    Type: String
+    Default: eks-hybrid
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-vpc'}]
+  Igw: {Type: AWS::EC2::InternetGateway}
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw}
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.192.0/20
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub '${WorkshopName}-pub-a'}
+        # Karpenter discovers where to launch burst nodes through this tag
+        - {Key: karpenter.sh/discovery, Value: eks-hybrid-workshop}
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.208.0/20
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: !Sub '${WorkshopName}-pub-b'}
+        - {Key: karpenter.sh/discovery, Value: eks-hybrid-workshop}
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: {RouteTableId: !Ref PublicRt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
+  RtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRt}
+  RtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRt}
+
+  # ---- Parameter contract consumed by the code-editor template
+  VpcIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/vpc-1-id'
+      Type: String
+      Value: !Ref Vpc
+  SubnetAParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/public-subnet-1a'
+      Type: String
+      Value: !Ref PublicSubnetA
+  SubnetBParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/public-subnet-1b'
+      Type: String
+      Value: !Ref PublicSubnetB
+
+  # EKS needs >= 2 subnets in different AZs (consumed by eks-hybrid-cluster.yaml)
+  ClusterSubnetsParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/cluster-subnets'
+      Type: StringList
+      Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+
+  # Consumed by eks-hybrid-datacenter.yaml: it adds the on-prem CIDR routes
+  # (10.80/16, 10.85/16) pointing at the Transit Gateway to THIS route table.
+  RouteTableParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/vpc-1-route-table'
+      Type: String
+      Value: !Ref PublicRt
+
+Outputs:
+  VpcId: {Value: !Ref Vpc}
+  RouteTableId: {Value: !Ref PublicRt}
+  PublicSubnets: {Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]}

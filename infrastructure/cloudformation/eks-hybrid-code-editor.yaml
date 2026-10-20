@@ -1,0 +1,1776 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EKS Hybrid Nodes Workshop - Browser IDE (code-server) behind CloudFront.
+  Provisioned via SSM State Manager on a standard AL2023 AMI (NO EC2 Image Builder):
+  the IDE is reachable in ~4-6 min instead of 15-30 min, with per-step execution
+  history in SSM for debugging. Fully self-contained for this workshop.
+
+Parameters:
+  WorkshopName:
+    Type: String
+    # MUST match the other four templates. This is the Parameter Store namespace the
+    # five stacks use to find each other, and it used to default to 'eks-hybrid-nodes'
+    # here while its siblings defaulted to 'eks-hybrid'. contentspec.yaml always passes
+    # it explicitly, so events were never affected - but a standalone deploy published
+    # this stack's ide-ssh-pubkey to /workshop/eks-hybrid-nodes/ while the Hyper-V host
+    # read /workshop/eks-hybrid/. Nothing failed at deploy time: all five stacks reached
+    # CREATE_COMPLETE and the VMs simply never built, ~30 minutes later, with
+    # 'SSM param ide-ssh-pubkey not published after 10 min' as the only clue.
+    # Measured 2026-08-20 in a real account.
+    Default: eks-hybrid
+    Description: Prefix for workshop resources (also the SSM parameter namespace)
+  VPCId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/dc-vpc-id
+  PublicSubnetId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/dc-dmz-subnet
+  EksVpcId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/vpc-1-id
+    Description: EKS VPC. The IDE may change source/destination check only on network interfaces in it
+  EKSClusterName:
+    Type: String
+    Default: eks-hybrid-workshop
+    Description: Cluster to pre-configure kubectl against (tolerates absence)
+  InstanceType:
+    Type: String
+    Default: t3.medium
+  CodeServerVersion:
+    Type: String
+    Default: 4.131.0
+    Description: Pinned code-server release (deterministic provisioning)
+  RootVolumeSize:
+    Type: Number
+    Default: 30
+  LatestAl2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  AssetsBucketName:
+    Type: String
+    Default: ''
+    Description: 'Assets bucket: your own in self-paced, the one Workshop Studio provides in an event'
+  AssetsBucketPrefix:
+    Type: String
+    Default: ''
+    Description: 'Key prefix inside the assets bucket: empty in self-paced, the one Workshop Studio provides in an event'
+
+Mappings:
+  # CloudFront origin-facing prefix lists (per region)
+  CloudFrontPrefixList:
+    us-east-1: {PrefixList: pl-3b927c52}
+    us-east-2: {PrefixList: pl-b6a144df}
+    us-west-2: {PrefixList: pl-82a045eb}
+    eu-west-1: {PrefixList: pl-4fa04526}
+    sa-east-1: {PrefixList: pl-9da543f4}
+
+Conditions:
+  HasAssetsBucket: !Not [!Equals [!Ref AssetsBucketName, '']]
+  # CloudFront access log delivery (standard logging v2) can only be configured
+  # in us-east-1, so the logging resources exist only there.
+  InUsEast1: !Equals [!Ref 'AWS::Region', us-east-1]
+
+Resources:
+  # ------------------------------------------------------------ IDE secrets
+  # Two independent random values, both in Secrets Manager:
+  #   /<WorkshopName>/ide-password         the viewer token. It is the one-click
+  #                                        sign-in credential, checked by nginx on
+  #                                        the instance. It is NOT a stack output
+  #                                        and NOT in the CloudFront Function code,
+  #                                        so DescribeStacks and GetFunction (both in
+  #                                        ReadOnlyAccess) do not reveal it.
+  #   /<WorkshopName>/ide-password-origin  the origin secret CloudFront adds as a
+  #                                        header, so the origin only answers this
+  #                                        distribution. Knowing it does not sign
+  #                                        anyone in.
+  # A custom resource generates both at deploy time, so the template never holds
+  # either value; CloudFront receives the origin secret as a NoEcho attribute.
+  IdePasswordFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: manage-ide-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['secretsmanager:CreateSecret', 'secretsmanager:PutSecretValue', 'secretsmanager:DeleteSecret', 'secretsmanager:DescribeSecret', 'secretsmanager:GetSecretValue', 'secretsmanager:TagResource']
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${WorkshopName}/ide-password*'
+
+  IdePasswordFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt IdePasswordFnRole.Arn
+      Code:
+        ZipFile: |
+          # Self-contained CFN response (the auto-provided 'cfnresponse' module is
+          # NOT available in the python3.13 runtime - validated 2026-08-02).
+          import json, urllib.request
+          def respond(event, ctx, status, data=None, no_echo=False, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f"see CloudWatch log stream {ctx.log_stream_name}",
+                  'PhysicalResourceId': event.get('PhysicalResourceId') or ctx.log_stream_name,
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'NoEcho': no_echo, 'Data': data or {}}).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                                           headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req)
+          import boto3, secrets, string
+          ALPHABET = string.ascii_letters + string.digits
+          def new_value(length):
+              return ''.join(secrets.choice(ALPHABET) for _ in range(length))
+          def store(sm, name, value):
+              try:
+                  sm.create_secret(Name=name, SecretString=value)
+              except sm.exceptions.ResourceExistsException:
+                  sm.put_secret_value(SecretId=name, SecretString=value)
+          def handler(event, ctx):
+              sm = boto3.client('secretsmanager')
+              name = event['ResourceProperties']['SecretName']
+              origin_name = name + '-origin'
+              try:
+                  if event['RequestType'] == 'Delete':
+                      for secret_id in (name, origin_name):
+                          try: sm.delete_secret(SecretId=secret_id, ForceDeleteWithoutRecovery=True)
+                          except sm.exceptions.ResourceNotFoundException: pass
+                      return respond(event, ctx, 'SUCCESS')
+                  # The viewer token stays in Secrets Manager only: it is never
+                  # returned, so no output, function code or event can carry it.
+                  store(sm, name, new_value(16))
+                  origin = new_value(32)
+                  store(sm, origin_name, origin)
+                  # NoEcho on the custom resource keeps it out of CFN console/events
+                  respond(event, ctx, 'SUCCESS', {'OriginSecret': origin, 'SecretName': name}, no_echo=True)
+              except Exception as e:
+                  respond(event, ctx, 'FAILED', reason=str(e))
+
+  IdePasswordSecret:
+    Type: Custom::IdePassword
+    Properties:
+      ServiceToken: !GetAtt IdePasswordFn.Arn
+      SecretName: !Sub '/${WorkshopName}/ide-password'
+
+  # ------------------------------------------------------------ IAM
+  IdeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # Workshop participants operate the cluster from this IDE, so whoever
+        # holds an IDE session holds this role. It names every action the labs,
+        # the preflight and the bootstrap below call, and scopes each write to
+        # this workshop's own resources: no service wildcard, no write on '*'
+        # other than the SSM activation calls, which accept nothing else.
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+        - PolicyName: workshop-ide
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Reads and lists without resource-level permissions, plus the SSM
+              # hybrid activation calls (module 2), which only accept '*'.
+              - Effect: Allow
+                Action:
+                  - eks:ListClusters
+                  - eks:DescribeAddonVersions
+                  - eks:DescribeAddonConfiguration
+                  - eks:ListAccessPolicies
+                  - ssm:CreateActivation
+                  # create-activation --tags needs AddTagsToResource, and page
+                  # 2.1 DOES pass --tags: without it the very first command of
+                  # module 2 fails with AccessDenied for every participant
+                  # (found walking the participant path on event 66489015). The
+                  # tag is not decoration - module 5.2's optional SSM shortcut
+                  # targets Key=tag:workshop,Values=eks-hybrid-nodes, so an
+                  # untagged node would be silently missed by it.
+                  - ssm:AddTagsToResource
+                  - ssm:ListTagsForResource
+                  - ssm:DescribeActivations
+                  - ssm:DeleteActivation
+                  - ssm:DescribeInstanceInformation
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommands
+                  # Module 5.3's optional shortcut sends a command to --targets
+                  # (every hybrid node at once), and the natural way to audit a
+                  # multi-target command is list-command-invocations - the other
+                  # two only cover "one invocation I already know the id of" and
+                  # "which commands exist". Without it the participant fires the
+                  # command and cannot check whether it worked: AccessDenied,
+                  # measured on event c813d0f5. Read-only.
+                  - ssm:ListCommandInvocations
+                  # preflight-check.sh reads the Hyper-V build state with this. Without
+                  # it the AccessDenied is swallowed and the check degrades to "pending".
+                  - ssm:DescribeAutomationExecutions
+                  - fis:ListExperimentTemplates
+                  - fis:ListExperiments
+                  - ec2:Describe*
+                  # read-only, for the WAN-link exploration in module 1: the TGW
+                  # route table is where hybrid becomes visible (10.80/16 and
+                  # 10.85/16 as static routes), and Search* is a separate action
+                  # from Describe* (found the hard way on event 7db9fa9b)
+                  - ec2:SearchTransitGatewayRoutes
+                  - ec2:GetTransitGateway*
+                  - iam:GetRole
+                  - iam:ListRoles
+                  # The preflight and the self-paced GPU page read this quota. Without
+                  # the grant, AccessDenied was swallowed and reported as quota 0 - a
+                  # personal account with 768 G vCPUs looked identical to an event
+                  # account whose real limit is zero (self-paced E2E 2026-09-08).
+                  - servicequotas:GetServiceQuota
+                  - cloudformation:Describe*
+                  - cloudformation:List*
+                  - aps:ListWorkspaces
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              # EKS: this workshop's cluster only. The bootstrap creates access
+              # entries and the DNS page updates the CoreDNS add-on; nothing here
+              # reaches another cluster in the account.
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListAddons
+                  - eks:DescribeAddon
+                  - eks:UpdateAddon
+                  - eks:DescribeUpdate
+                  - eks:ListUpdates
+                  - eks:ListNodegroups
+                  - eks:DescribeNodegroup
+                  - eks:ListAccessEntries
+                  - eks:DescribeAccessEntry
+                  - eks:CreateAccessEntry
+                  - eks:ListAssociatedAccessPolicies
+                  - eks:AssociateAccessPolicy
+                  - eks:ListPodIdentityAssociations
+                  - eks:DescribePodIdentityAssociation
+                  - eks:AccessKubernetesApi
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${EKSClusterName}'
+                  - !Sub 'arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:addon/${EKSClusterName}/*'
+                  - !Sub 'arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:nodegroup/${EKSClusterName}/*'
+                  - !Sub 'arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:access-entry/${EKSClusterName}/*'
+                  - !Sub 'arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:podidentityassociation/${EKSClusterName}/*'
+              # Run Command: only the two drill documents of module 5
+              # (workshop-block/unblock-control-plane), and only on the managed
+              # instances that create-activation tagged workshop=eks-hybrid-nodes.
+              # Two statements because the tag condition applies to the instance;
+              # the documents carry no tag.
+              - Effect: Allow
+                Action: ['ssm:SendCommand']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/workshop-block-control-plane'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/workshop-unblock-control-plane'
+              - Effect: Allow
+                Action: ['ssm:SendCommand']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:managed-instance/*'
+                Condition:
+                  StringEquals:
+                    'ssm:resourceTag/workshop': eks-hybrid-nodes
+              # The workshop's own parameter namespace. PutParameter is the IDE
+              # publishing ide-ssh-pubkey for the Hyper-V automation.
+              - Effect: Allow
+                Action: ['ssm:GetParameter', 'ssm:GetParameters', 'ssm:PutParameter']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/workshop/${WorkshopName}/*'
+              - Effect: Allow
+                Action: ['ssm:StartAutomationExecution']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${WorkshopName}-*:*'
+              - Effect: Allow
+                Action: ['ssm:GetAutomationExecution']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-execution/*'
+              # FIS (module 5): start only the templates this workshop tagged,
+              # then read and stop the experiments they create.
+              - Effect: Allow
+                Action: ['fis:StartExperiment']
+                Resource: !Sub 'arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment-template/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/workshop': !Ref WorkshopName
+              - Effect: Allow
+                Action: ['fis:GetExperimentTemplate']
+                Resource: !Sub 'arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment-template/*'
+              - Effect: Allow
+                Action: ['fis:StartExperiment', 'fis:GetExperiment', 'fis:StopExperiment']
+                Resource: !Sub 'arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment/*'
+              # A gateway node forwards traffic for pod IPs it does not own, so
+              # EC2 source/destination check MUST be off on its ENI or every
+              # cloud-to-pod packet is silently dropped by the network. Found on
+              # event 6ffe7c80: gateway healthy, routes correct, VTEP synced, and
+              # cloud-to-pod still timed out - because SourceDestCheck was True.
+              # Limited to network interfaces in the EKS VPC.
+              - Effect: Allow
+                Action: ['ec2:ModifyNetworkInterfaceAttribute']
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                Condition:
+                  ArnEquals:
+                    'ec2:Vpc': !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${EksVpcId}'
+              # CloudWatch Logs and Amazon Managed Service for Prometheus: read
+              # only, on what this workshop creates.
+              - Effect: Allow
+                Action: ['logs:DescribeLogStreams', 'logs:GetLogEvents', 'logs:FilterLogEvents']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/fis/${WorkshopName}*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/containerinsights/${EKSClusterName}/*'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${WorkshopName}-images*'
+              - Effect: Allow
+                Action: ['aps:DescribeWorkspace']
+                Resource: !Sub 'arn:${AWS::Partition}:aps:${AWS::Region}:${AWS::AccountId}:workspace/*'
+              # iam:PassRole scoped to the workshop's own roles. The participant
+              # genuinely needs it - module 2's `create-activation --iam-role
+              # eks-hybrid-nodes-role` PASSES that role to Systems Manager - but with
+              # Resource '*' the IDE could hand ANY role in the account to a service,
+              # which IAM Access Analyzer flags as a SECURITY_WARNING (confirmed on the
+              # live accounts of event a135e903). Narrowed to the roles this workshop
+              # creates, which is everything the labs pass.
+              - Effect: Allow
+                Action: ['iam:PassRole']
+                # Exact role ARN plus the service condition, matching what the
+                # Hyper-V template already does for the same call. A prefix wildcard
+                # would still let the IDE hand any future eks-hybrid* role to any
+                # service. The only role the participant passes is this one, to
+                # Systems Manager, in module 2's create-activation - re-verified live
+                # on event a135e903 after narrowing.
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/eks-hybrid-nodes-role'
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': 'ssm.amazonaws.com'
+              # A fresh account has no FIS service-linked role, and the FIRST
+              # command of module 5.1 (fis start-experiment) creates it on the
+              # fly - which fails with AccessDenied without this. Exactly the trap
+              # already handled for the EC2 Spot SLR in the cluster stack; found
+              # walking module 5 on event 66489015. Scoped to the FIS service
+              # principal so it cannot mint any other service role.
+              - Effect: Allow
+                Action: ['iam:CreateServiceLinkedRole']
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/fis.amazonaws.com/*'
+                Condition:
+                  StringEquals:
+                    'iam:AWSServiceName': fis.amazonaws.com
+              # Only the workshop's own secrets: the two IDE values (configureIde)
+              # and the Hyper-V RDP credential the lab-environment page reads from
+              # this terminal. The grant on every secret in the account is gone.
+              - Effect: Allow
+                Action: ['secretsmanager:GetSecretValue']
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${WorkshopName}/ide-password*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${WorkshopName}/hyperv-rdp-credentials*'
+              # The RDP credential is encrypted with the Hyper-V stack's customer
+              # managed key, which this stack cannot reference (it deploys later).
+              # Decrypt is allowed only through Secrets Manager and only for that
+              # secret, via the encryption context Secrets Manager always sends.
+              - Effect: Allow
+                Action: ['kms:Decrypt']
+                Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+                  StringLike:
+                    'kms:EncryptionContext:SecretARN': !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${WorkshopName}/hyperv-rdp-credentials*'
+              - Effect: Allow
+                Action: ['s3:PutObject', 's3:GetObject']
+                Resource: !Sub 'arn:aws:s3:::${WorkshopName}-ssm-out-${AWS::AccountId}-${AWS::Region}/*'
+              # participant assets: synced from the Workshop Studio assets bucket
+              # (statement omitted entirely when no bucket is configured)
+              - !If
+                - HasAssetsBucket
+                - Effect: Allow
+                  Action: ['s3:GetObject', 's3:ListBucket']
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${AssetsBucketName}'
+                    - !Sub 'arn:aws:s3:::${AssetsBucketName}/*'
+                - !Ref AWS::NoValue
+  IdeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref IdeRole]}
+
+  # Grant the IDE role admin on the cluster so participants can run kubectl.
+  # Lives here (not in the cluster stack) because this is where IdeRole exists -
+  # the cluster stack deploys first and cannot reference a role that comes later.
+  IdeClusterAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EKSClusterName
+      PrincipalArn: !GetAtt IdeRole.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope: {Type: cluster}
+
+  # ------------------------------------------------------------ SSM setup document
+  # Replaces the EC2 Image Builder pipeline: same installation steps, executed
+  # in place on a standard AMI. State Manager re-applies if the instance is
+  # replaced, andevery step is visible in SSM execution history.
+  IdeSetupDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${WorkshopName}-ide-setup'
+      DocumentType: Command
+      DocumentFormat: YAML
+      # Content changes create a NEW VERSION instead of replacing the document.
+      # Without this, a named SSM Document cannot be updated in place (CFN error:
+      # "cannot update a stack when a custom-named resource requires replacing").
+      UpdateMethod: NewVersion
+      TargetType: /AWS::EC2::Instance
+      Content:
+        schemaVersion: '2.2'
+        description: Install and configure code-server + workshop tooling
+        parameters:
+          IdePasswordSecretId:
+            type: String
+            description: Secrets Manager id holding the IDE password
+          ClusterName:
+            type: String
+            default: eks-hybrid-workshop
+          CodeServerVersion:
+            type: String
+            default: 4.131.0
+          WorkshopNameParam:
+            type: String
+            default: eks-hybrid
+            description: SSM parameter namespace (/workshop/<name>/...)
+          AssetsBucketNameParam:
+            type: String
+            default: ''
+            description: 'Assets bucket (participant assets under <prefix>workshop/): your own in self-paced, the one Workshop Studio provides in an event'
+          AssetsBucketPrefixParam:
+            type: String
+            default: ''
+            description: 'Key prefix inside the assets bucket: empty in self-paced, the one Workshop Studio provides in an event'
+          ArtifactBucketName:
+            type: String
+            description: Account-local S3 bucket where the IDE publishes the converted Hyper-V base image
+        mainSteps:
+          - action: aws:runShellScript
+            name: installTools
+            inputs:
+              timeoutSeconds: '900'
+              runCommand:
+                - |
+                  set -euxo pipefail
+                  export HOME=/root
+                  CODE_SERVER_VERSION="{{ CodeServerVersion }}"
+                  # idempotency guard includes qemu-img: the marker predates the
+                  # Hyper-V conversion move, so checking the file alone would skip
+                  # the newly required package on an updated instance.
+                  if [ -f /opt/workshop/.tools-installed ] && command -v qemu-img >/dev/null; then echo "tools present, skipping"; exit 0; fi
+                  dnf update -y
+                  # qemu-img comes from the AL2023 distro repository. We execute it
+                  # here and redistribute no binary, removing the unreachable
+                  # cloudbase.it Windows build from the participant runtime.
+                  dnf install -y git jq unzip wget tar gzip bind-utils nginx qemu-img
+                  # CLI tools: pinned releases, each checked against a sha256 recorded
+                  # here (taken 2026-10-14 and cross-checked with the sums each project
+                  # publishes), so a moved "latest" or a tampered download fails the
+                  # step instead of landing on the box. kubectl matches the cluster
+                  # minor (1.36). To upgrade, change the version AND its sha256.
+                  fetch() {  # url sha256 destination
+                    curl -fsSL --retry 3 --connect-timeout 20 -o "$3" "$1"
+                    echo "$2  $3" | sha256sum -c -
+                  }
+                  T=$(mktemp -d)
+                  fetch https://dl.k8s.io/release/v1.36.5/bin/linux/amd64/kubectl \
+                    33bc88a24c3b09cf55bfd59e6ca977881b61fc3f25ab65bc80c65b430248648e "$T/kubectl"
+                  install -m 0755 "$T/kubectl" /usr/local/bin/kubectl
+                  fetch https://get.helm.sh/helm-v3.22.0-linux-amd64.tar.gz \
+                    1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb "$T/helm.tar.gz"
+                  tar xzf "$T/helm.tar.gz" -C "$T" linux-amd64/helm
+                  install -m 0755 "$T/linux-amd64/helm" /usr/local/bin/helm
+                  fetch https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64 \
+                    8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f "$T/yq"
+                  install -m 0755 "$T/yq" /usr/local/bin/yq
+                  # k9s (handy for the resilience modules)
+                  fetch https://github.com/derailed/k9s/releases/download/v0.51.0/k9s_Linux_amd64.tar.gz \
+                    c3752ad51a5a4015a113819c4eeb6e55a4d0e4b8e652494797532f6fc8161dd7 "$T/k9s.tar.gz"
+                  tar xzf "$T/k9s.tar.gz" -C "$T" k9s
+                  install -m 0755 "$T/k9s" /usr/local/bin/k9s
+                  rm -rf "$T"
+                  # code-server: pinned rpm (deterministic; avoids piping a remote
+                  # script to sh and its $HOME dependency, and is ~2x faster)
+                  curl -sLO "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server-${CODE_SERVER_VERSION}-amd64.rpm"
+                  dnf install -y "./code-server-${CODE_SERVER_VERSION}-amd64.rpm"
+                  rm -f "code-server-${CODE_SERVER_VERSION}-amd64.rpm"
+                  test -x /usr/bin/code-server
+                  mkdir -p /opt/workshop && touch /opt/workshop/.tools-installed
+          - action: aws:runShellScript
+            name: prepareHypervImage
+            inputs:
+              timeoutSeconds: '1200'
+              runCommand:
+                - |
+                  set -euxo pipefail
+                  BUCKET="{{ ArtifactBucketName }}"
+                  KEY=hyperv/ubuntu-24.04-base.vhdx
+                  MIN_BYTES=500000000
+                  RELEASE=https://cloud-images.ubuntu.com/releases/noble/release
+                  IMAGE=ubuntu-24.04-server-cloudimg-amd64.img
+                  # Re-runs are cheap, but only for an object THIS step published: size >=
+                  # MIN_BYTES AND the sha256 metadata written below. That metadata is set only
+                  # after the qcow2 matched Canonical's SHA256SUMS and both images passed
+                  # qemu-img check, so an object without it (older producer, manual upload,
+                  # partial write) is rebuilt instead of trusted on size alone. Event Test
+                  # 15fea548 (2026-10-13) shipped a base that had the right size and was unreadable.
+                  read -r SIZE SHA <<<"$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" \
+                    --query '[ContentLength, Metadata.sha256]' --output text 2>/dev/null || echo '0 None')"
+                  if [ "${SIZE:-0}" -ge "$MIN_BYTES" ] && [[ "${SHA:-}" =~ ^[0-9a-f]{64}$ ]]; then
+                    echo "VHDX_READY: s3://${BUCKET}/${KEY} (${SIZE} bytes, sha256 ${SHA}, reused)"
+                    exit 0
+                  fi
+                  WORK=/var/tmp/hyperv-image
+                  mkdir -p "$WORK"
+                  curl -fL --retry 3 --connect-timeout 20 "$RELEASE/$IMAGE" -o "$WORK/ubuntu.img"
+                  # Integrity of the SOURCE: the checksum list comes from the same release
+                  # directory as the image, and the image must match its entry exactly.
+                  curl -fL --retry 3 --connect-timeout 20 "$RELEASE/SHA256SUMS" -o "$WORK/SHA256SUMS"
+                  EXPECTED=$(awk -v f="*$IMAGE" '$2 == f {print $1}' "$WORK/SHA256SUMS")
+                  [[ "$EXPECTED" =~ ^[0-9a-f]{64}$ ]] || { echo "no sha256 for $IMAGE in $RELEASE/SHA256SUMS"; exit 1; }
+                  SOURCE_SHA=$(sha256sum "$WORK/ubuntu.img" | cut -d' ' -f1)
+                  [ "$SOURCE_SHA" = "$EXPECTED" ] || { echo "qcow2 sha256 mismatch: got $SOURCE_SHA, SHA256SUMS says $EXPECTED"; exit 1; }
+                  # Structure of both images: any non-zero exit (error, corruption, leak) fails.
+                  qemu-img check -f qcow2 "$WORK/ubuntu.img"
+                  qemu-img convert -p -f qcow2 -O vhdx -o subformat=dynamic \
+                    "$WORK/ubuntu.img" "$WORK/ubuntu-base.vhdx"
+                  qemu-img check -f vhdx "$WORK/ubuntu-base.vhdx"
+                  SIZE=$(stat -c %s "$WORK/ubuntu-base.vhdx")
+                  [ "$SIZE" -ge "$MIN_BYTES" ] || { echo "converted VHDX too small: $SIZE"; exit 1; }
+                  SHA=$(sha256sum "$WORK/ubuntu-base.vhdx" | cut -d' ' -f1)
+                  aws s3 cp "$WORK/ubuntu-base.vhdx" "s3://${BUCKET}/${KEY}" \
+                    --metadata "sha256=${SHA},source-sha256=${SOURCE_SHA}" --only-show-errors
+                  read -r REMOTE REMOTE_SHA <<<"$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" \
+                    --query '[ContentLength, Metadata.sha256]' --output text)"
+                  [ "$REMOTE" = "$SIZE" ] || { echo "S3 size mismatch: local=$SIZE remote=$REMOTE"; exit 1; }
+                  [ "$REMOTE_SHA" = "$SHA" ] || { echo "S3 sha256 metadata mismatch: local=$SHA remote=$REMOTE_SHA"; exit 1; }
+                  rm -f "$WORK/ubuntu.img" "$WORK/ubuntu-base.vhdx" "$WORK/SHA256SUMS"
+                  echo "VHDX_READY: s3://${BUCKET}/${KEY} (${REMOTE} bytes, sha256 ${SHA}, created)"
+          - action: aws:runShellScript
+            name: configureIde
+            inputs:
+              timeoutSeconds: '300'
+              runCommand:
+                - |
+                  set -euxo pipefail
+                  REGION=$(curl -sH "X-aws-ec2-metadata-token: $(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')" http://169.254.169.254/latest/meta-data/placement/region)
+                  install -d -o ec2-user -g ec2-user /home/ec2-user/environment /home/ec2-user/.config/code-server
+                  # Simple Browser needs the extensions registry file to exist, or the
+                  # command fails with "Unable to read file .../extensions/extensions.json"
+                  # (code-server only creates it after the first extension install, which
+                  # this IDE never does). Found in the field: page 4.1 Step 2 broke for
+                  # the participant until this file existed.
+                  install -d -o ec2-user -g ec2-user /home/ec2-user/.local/share/code-server/extensions
+                  [ -f /home/ec2-user/.local/share/code-server/extensions/extensions.json ] || echo '[]' > /home/ec2-user/.local/share/code-server/extensions/extensions.json
+                  chown ec2-user:ec2-user /home/ec2-user/.local/share/code-server/extensions/extensions.json
+                  # Authentication happens HERE, on the instance, not at the edge.
+                  # The CloudFront Function only moves ?tkn= into an HttpOnly cookie
+                  # and holds no secret, so it cannot be the boundary. nginx on :8080
+                  # decides, with two independent values from Secrets Manager:
+                  #   - the origin secret header that only THIS distribution injects.
+                  #     The security group admits the AWS-managed CloudFront prefix
+                  #     list, which every distribution shares, so without it a
+                  #     third-party distribution could reach this origin. CloudFront
+                  #     overwrites the header, so a viewer cannot supply it.
+                  #   - the viewer token in the ws_ide_auth cookie (the one-click
+                  #     sign-in credential), which is never a stack output and never
+                  #     in the function code.
+                  # code-server itself can remain auth:none because it binds only to
+                  # loopback :8081 - there is no network path to it that skips nginx.
+                  cat > /home/ec2-user/.config/code-server/config.yaml <<EOF
+                  # Origin is loopback-only. nginx owns :8080 and rejects requests
+                  # without the origin secret header and a valid viewer token cookie.
+                  bind-addr: 127.0.0.1:8081
+                  auth: none
+                  cert: false
+                  EOF
+                  chown -R ec2-user:ec2-user /home/ec2-user/.config
+                  # Tracing OFF while the secrets are in shell variables: this step's
+                  # output goes to S3 and to the Run Command history, and `set -x`
+                  # would print both values there.
+                  { set +x; } 2>/dev/null
+                  TOKEN=$(aws secretsmanager get-secret-value --secret-id "{{ IdePasswordSecretId }}" --region "$REGION" --query SecretString --output text)
+                  ORIGIN_SECRET=$(aws secretsmanager get-secret-value --secret-id "{{ IdePasswordSecretId }}-origin" --region "$REGION" --query SecretString --output text)
+                  [[ "$TOKEN" =~ ^[A-Za-z0-9]{16,128}$ ]] || { echo "ERROR: IDE token secret is empty or malformed" >&2; exit 1; }
+                  [[ "$ORIGIN_SECRET" =~ ^[A-Za-z0-9]{16,128}$ ]] || { echo "ERROR: IDE origin secret is empty or malformed" >&2; exit 1; }
+                  # root-only: the file holds both values. The nginx master reads it as root.
+                  install -m 0600 -o root -g root /dev/null /etc/nginx/conf.d/workshop-ide.conf
+                  # The access log records the path without the query string.
+                  cat > /etc/nginx/conf.d/workshop-ide.conf <<EOF
+                  map \$cookie_ws_ide_auth \$workshop_ide_viewer_ok { "$TOKEN" 1; default 0; }
+                  log_format workshop_ide_noquery '\$remote_addr [\$time_local] "\$request_method \$uri \$server_protocol" \$status \$body_bytes_sent';
+                  server {
+                    listen 8080;
+                    access_log /var/log/nginx/workshop-ide-access.log workshop_ide_noquery;
+                    if (\$http_x_workshop_origin_secret != "$ORIGIN_SECRET") { return 403; }
+                    if (\$workshop_ide_viewer_ok = 0) { return 401; }
+                    location / {
+                      proxy_pass http://127.0.0.1:8081;
+                      proxy_http_version 1.1;
+                      proxy_set_header Host \$host;
+                      proxy_set_header Upgrade \$http_upgrade;
+                      proxy_set_header Connection "upgrade";
+                      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto \$scheme;
+                      proxy_set_header X-Workshop-Origin-Secret "";
+                    }
+                  }
+                  EOF
+                  unset TOKEN ORIGIN_SECRET
+                  set -x
+                  nginx -t
+                  cat > /etc/systemd/system/code-server@.service <<'EOF'
+                  [Unit]
+                  Description=code-server
+                  After=network-online.target
+                  Wants=network-online.target
+                  [Service]
+                  Type=simple
+                  User=%i
+                  WorkingDirectory=/home/%i/environment
+                  Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+                  ExecStart=/usr/bin/code-server --config /home/%i/.config/code-server/config.yaml /home/%i/environment
+                  Restart=always
+                  RestartSec=5
+                  [Install]
+                  WantedBy=multi-user.target
+                  EOF
+                  # VS Code user settings: dark theme + suppress the popups that
+                  # get in the way during a live workshop (welcome page, trust
+                  # dialog, telemetry, update banners, chat/getting-started).
+                  # WRITTEN ONCE: State Manager re-applies this document every 30
+                  # minutes, and writing it unconditionally would silently revert
+                  # any preference the participant changed mid-workshop.
+                  SETTINGS=/home/ec2-user/.local/share/code-server/User/settings.json
+                  if [ ! -f "$SETTINGS" ]; then
+                    install -d -o ec2-user -g ec2-user /home/ec2-user/.local/share/code-server/User
+                    cat > "$SETTINGS" <<'JSON'
+                  {
+                    "workbench.colorTheme": "Visual Studio Dark",
+                    "workbench.startupEditor": "none",
+                    "workbench.tips.enabled": false,
+                    "workbench.welcomePage.walkthroughs.openOnInstall": false,
+                    "security.workspace.trust.enabled": false,
+                    "security.workspace.trust.startupPrompt": "never",
+                    "security.workspace.trust.banner": "never",
+                    "telemetry.telemetryLevel": "off",
+                    "update.mode": "none",
+                    "update.showReleaseNotes": false,
+                    "extensions.autoCheckUpdates": false,
+                    "extensions.ignoreRecommendations": true,
+                    "git.openRepositoryInParentFolders": "never",
+                    "window.commandCenter": false,
+                    "chat.commandCenter.enabled": false,
+                    "terminal.integrated.defaultProfile.linux": "bash",
+                    "terminal.integrated.fontSize": 14,
+                    "editor.fontSize": 14,
+                    "files.autoSave": "afterDelay",
+                    "task.allowAutomaticTasks": "on"
+                  }
+                  JSON
+                    chown ec2-user:ec2-user "$SETTINGS"
+                  fi
+                  # auto-open terminal on IDE load (folderOpen task): the workshop
+                  # is terminal-first, participants should never hunt for it.
+                  # bash -l never exits, so the task terminal stays interactive.
+                  TASKS=/home/ec2-user/environment/.vscode/tasks.json
+                  if [ ! -f "$TASKS" ]; then
+                    install -d -o ec2-user -g ec2-user /home/ec2-user/environment/.vscode
+                    cat > "$TASKS" <<'JSON'
+                  {
+                    "version": "2.0.0",
+                    "tasks": [
+                      {
+                        "label": "Workshop terminal",
+                        "type": "shell",
+                        "command": "bash -l",
+                        "isBackground": true,
+                        "presentation": {
+                          "reveal": "always",
+                          "focus": true,
+                          "panel": "dedicated",
+                          "showReuseMessage": false
+                        },
+                        "runOptions": {"runOn": "folderOpen"}
+                      }
+                    ]
+                  }
+                  JSON
+                    chown ec2-user:ec2-user "$TASKS"
+                  fi
+                  # code-server's own first-run query prompt
+                  install -d -o ec2-user -g ec2-user /home/ec2-user/.config/code-server
+                  systemctl daemon-reload
+                  systemctl enable --now code-server@ec2-user
+                  systemctl enable --now nginx
+                  # Re-read the config on every run, so a token rotated in Secrets
+                  # Manager takes effect at the next association run (README,
+                  # Security and Hardening) without replacing the instance.
+                  systemctl reload nginx
+          - action: aws:runShellScript
+            name: clusterBootstrap
+            inputs:
+              timeoutSeconds: '900'
+              runCommand:
+                - |
+                  # Installs the cluster-side components module 6 depends on:
+                  # Karpenter (node autoscaling), KEDA (pod autoscaling) and the
+                  # burst NodePools. Runs from the IDE because it already has
+                  # helm, kubectl and cluster admin. Idempotent on the 30-minute
+                  # State Manager re-run: helm upgrade --install converges, and
+                  # kubectl apply is safe for objects the participant never edits.
+                  # The ONE exception is the KEDA ScaledObject at the end of this
+                  # step - module 6.4 has the participant change it, so it is
+                  # create-only behind an existence guard. Read the comment there
+                  # before turning it back into a plain apply.
+                  set -uxo pipefail
+                  export HOME=/root
+                  REGION=$(curl -sH "X-aws-ec2-metadata-token: $(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')" http://169.254.169.254/latest/meta-data/placement/region)
+                  CLUSTER="{{ ClusterName }}"
+                  # Bounded wait for ACTIVE. The old `update-kubeconfig ... || exit 0` turned a
+                  # cluster that was not ready (or not there) into a SILENT success with nothing
+                  # installed. CREATING/UPDATING are waited for, DELETING/FAILED never become
+                  # ACTIVE and fail at once, and 600 s leaves this step's 900 s timeout room for
+                  # the installs below. A failure here is visible: the create-time phase fails
+                  # the stack, a 30-minute run marks the association and the next run retries.
+                  STATUS=UNKNOWN
+                  DEADLINE=$((SECONDS + 600))
+                  while :; do
+                    STATUS=$(aws eks describe-cluster --region "$REGION" --name "$CLUSTER" \
+                      --query cluster.status --output text) || STATUS=UNREACHABLE
+                    case "$STATUS" in
+                      ACTIVE) break ;;
+                      DELETING|FAILED)
+                        echo "ERROR: cluster $CLUSTER is $STATUS; clusterBootstrap needs it ACTIVE" >&2
+                        exit 1 ;;
+                    esac
+                    if [ "$SECONDS" -ge "$DEADLINE" ]; then
+                      echo "ERROR: cluster $CLUSTER still $STATUS after 600 s; clusterBootstrap needs it ACTIVE" >&2
+                      exit 1
+                    fi
+                    echo "cluster $CLUSTER is $STATUS - waiting for ACTIVE"
+                    sleep 15
+                  done
+                  aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER" || {
+                    echo "ERROR: update-kubeconfig failed for ACTIVE cluster $CLUSTER" >&2
+                    exit 1
+                  }
+
+                  # --- Console access for the human running the workshop.
+                  # The cluster stack creates this entry from the
+                  # {{.ParticipantRoleArn}} magic variable, but if that resolves
+                  # empty (self-paced deploys, or a plain CFN deploy) the AWS
+                  # console shows an access error on the Nodes tab and the
+                  # participant is stuck. This discovers the likely human role and
+                  # ensures the entry exists. Idempotent and re-run every 30 min by
+                  # the association, so it also SELF-HEALS a deleted entry.
+                  ensure_access_entry() {
+                    local arn="$1"
+                    [ -z "$arn" ] && return 0
+                    aws eks describe-access-entry --cluster-name "$CLUSTER" --principal-arn "$arn" >/dev/null 2>&1 || \
+                      aws eks create-access-entry --cluster-name "$CLUSTER" --principal-arn "$arn" --type STANDARD >/dev/null 2>&1 || return 0
+                    aws eks list-associated-access-policies --cluster-name "$CLUSTER" --principal-arn "$arn" \
+                      --query 'associatedAccessPolicies[].policyArn' --output text 2>/dev/null | grep -q ClusterAdmin || \
+                      aws eks associate-access-policy --cluster-name "$CLUSTER" --principal-arn "$arn" \
+                        --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+                        --access-scope type=cluster >/dev/null 2>&1
+                    echo "access entry ensured: $arn"
+                  }
+                  ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+                  # Workshop Studio participant role, then the usual admin roles
+                  for RN in WSParticipantRole admin Admin; do
+                    aws iam get-role --role-name "$RN" >/dev/null 2>&1 && \
+                      ensure_access_entry "arn:aws:iam::${ACCOUNT}:role/${RN}"
+                  done
+                  # SSO / Identity Center admin (federated console sessions)
+                  for RN in $(aws iam list-roles --query 'Roles[?starts_with(RoleName, `AWSReservedSSO_AdministratorAccess`)].RoleName' --output text 2>/dev/null); do
+                    ensure_access_entry "arn:aws:iam::${ACCOUNT}:role/aws-reserved/sso.amazonaws.com/${RN}" || true
+                  done
+                  KV=$(aws ssm get-parameter --name "/workshop/{{ WorkshopNameParam }}/karpenter-version" --query Parameter.Value --output text 2>/dev/null || echo "1.14.0")
+                  QUEUE=$(aws ssm get-parameter --name "/workshop/{{ WorkshopNameParam }}/karpenter-queue" --query Parameter.Value --output text 2>/dev/null || echo "${CLUSTER}-karpenter")
+                  NODEROLE=$(aws ssm get-parameter --name "/workshop/{{ WorkshopNameParam }}/node-role-name" --query Parameter.Value --output text 2>/dev/null)
+                  # Select subnets and SG by ID, never by tag: tag selectors match
+                  # across VPCs and a leftover cluster of the same name breaks the
+                  # launch ("belong to different networks").
+                  SUBNETS=$(aws ssm get-parameter --name "/workshop/{{ WorkshopNameParam }}/cluster-subnets" --query Parameter.Value --output text)
+                  CLUSTER_SG=$(aws ssm get-parameter --name "/workshop/{{ WorkshopNameParam }}/cluster-security-group" --query Parameter.Value --output text)
+                  SUBNET_TERMS=$(echo "$SUBNETS" | tr ',' '\n' | sed 's/^/{id: /; s/$/}/' | paste -sd, -)
+
+                  # --- Cilium (CNI for hybrid nodes). Pre-installed cluster-wide
+                  # so the pre-joined hybrid-node-1 goes Ready at provisioning and
+                  # the participant's node (module 2) is picked up automatically by
+                  # the DaemonSet - the content teaches exactly this behavior.
+                  # nodeAffinity scopes it to hybrid nodes; cloud nodes keep VPC CNI.
+                  # The EKS DISTRIBUTION of Cilium, not upstream, and vtep.enabled is
+                  # the reason. The Hybrid Nodes gateway installed below upserts a
+                  # CiliumVTEPConfig custom resource to tell the agents where to send
+                  # VPC-bound traffic, and that CRD ships ONLY with the EKS build.
+                  # With upstream Cilium the gateway starts, wins the leader election,
+                  # programs the VPC routes correctly and THEN dies with
+                  #   upserting CiliumVTEPConfig: no matches for kind CiliumVTEPConfig
+                  # and crash-loops, so cloud-to-pod traffic never works. Observed on
+                  # event 6ffe7c80 while validating this - the reference demo's README
+                  # still installs upstream Cilium, which no longer satisfies gateway
+                  # 1.0.0. 1.19.2-1 is the minimum EKS version carrying VTEP (the
+                  # others are 1.17.13-1 and 1.18.8-1), and l7Proxy must be OFF because
+                  # with it enabled VTEP traffic can be intercepted and dropped.
+                  # NATIVE routing stays: the pod CIDR is routable on the data center
+                  # LAN (the Hyper-V host carries the 10.85/16 route), so Cilium needs
+                  # no overlay of its own between the two hybrid nodes.
+                  helm upgrade --install cilium oci://public.ecr.aws/eks/cilium/cilium \
+                    --version 1.19.2-1 \
+                    --namespace kube-system \
+                    --set affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=eks.amazonaws.com/compute-type \
+                    --set affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=In \
+                    --set affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]=hybrid \
+                    --set routingMode=tunnel \
+                    --set tunnelProtocol=vxlan \
+                    --set ipv4NativeRoutingCIDR="10.85.0.0/16" \
+                    --set egressMasqueradeInterfaces=eth0 \
+                    --set vtep.enabled=true \
+                    --set l7Proxy=false \
+                    --set ipam.mode=cluster-pool \
+                    --set ipam.operator.clusterPoolIPv4PodCIDRList[0]="10.85.0.0/16" \
+                    --set operator.unmanagedPodWatcher.restart=false \
+                    --set operator.replicas=1 \
+                    --set envoy.enabled=false
+
+                  # --- EKS Hybrid Nodes gateway. This is BASE infrastructure, not an
+                  # optional extra: it is what makes cloud-to-pod traffic work without
+                  # asking a network team to route a Kubernetes overlay - control plane
+                  # to webhooks on hybrid nodes, cloud pod to on-premises pod, and AWS
+                  # services such as ALB/NLB target-type ip and Amazon Managed
+                  # Prometheus reaching hybrid pods. It builds VXLAN tunnels to the
+                  # Cilium agents and maintains the VPC route table entries itself,
+                  # pointing the pod CIDR at whichever gateway holds the leader lease.
+                  # Placement comes from the CHART, not from us: it renders the
+                  # nodeSelector from `nodeLabel` (default hybrid-gateway-node) and
+                  # the matching NoSchedule toleration, plus pod anti-affinity so the
+                  # two replicas land on different nodes. It also runs hostNetwork
+                  # with a plain ServiceAccount, which is why the route permissions
+                  # belong on the NODE role rather than a Pod Identity association.
+                  # autoMode.enabled is a value of the GATEWAY CHART, not a cluster
+                  # feature: it asks "is this cluster EKS Auto Mode?". This workshop is
+                  # NOT Auto Mode and never was - the cluster template sets no
+                  # computeConfig, node capacity comes from managed node groups plus
+                  # Karpenter for the burst tier, and hybrid nodes deliberately run a
+                  # kubelet we own, which is exactly what Auto Mode does not allow.
+                  # So false is the answer that keeps us OFF Auto Mode.
+                  # It is LOAD-BEARING: left at its default true,
+                  # the chart adds `eks.amazonaws.com/compute-type: auto` to the
+                  # nodeSelector, which a managed node group never carries - the pods
+                  # would sit Pending forever and cloud-to-pod traffic would simply
+                  # never work. Verified by rendering the chart both ways before
+                  # deploying anything.
+                  # Turn OFF source/destination check on every gateway node ENI.
+                  # This is not optional and it is not cosmetic: a gateway forwards
+                  # packets addressed to on-premises POD IPs, which are not its own
+                  # addresses, and EC2 drops exactly that unless the check is off.
+                  # The symptom when it is on is maddening, because everything else
+                  # looks right - gateway pods Running, leader lease held, VPC routes
+                  # programmed, CiliumVTEPConfig synced - and cloud-to-pod simply
+                  # times out. Doing it here rather than in a launch template keeps
+                  # the node group plain, and because this whole document re-runs on
+                  # a 30 minute association it also self-heals a replaced node.
+                  # Wait for the gateway node group to actually have instances. The
+                  # loop below is a no-op against an empty set, and a no-op here means
+                  # source/dest check stays ON and cloud-to-pod silently never works.
+                  # The 30 minute association would eventually heal it, but a
+                  # participant reaching module 3 in the meantime would hit a black
+                  # hole with nothing obviously broken.
+                  for _ in $(seq 1 30); do
+                    GW_COUNT=$(aws ec2 describe-instances \
+                      --filters "Name=tag:eks:nodegroup-name,Values=*GatewayNodeGroup*" \
+                                "Name=instance-state-name,Values=running" \
+                      --query 'length(Reservations[].Instances[])' --output text 2>/dev/null || echo 0)
+                    [ "${GW_COUNT:-0}" -ge 2 ] && break
+                    echo "waiting for gateway nodes (have ${GW_COUNT:-0} of 2)..."
+                    sleep 20
+                  done
+
+                  for GW_I in $(aws ec2 describe-instances \
+                      --filters "Name=tag:eks:nodegroup-name,Values=*GatewayNodeGroup*" \
+                                "Name=instance-state-name,Values=running" \
+                      --query 'Reservations[].Instances[].InstanceId' --output text); do
+                    for GW_ENI in $(aws ec2 describe-instances --instance-ids "$GW_I" \
+                        --query 'Reservations[0].Instances[0].NetworkInterfaces[].NetworkInterfaceId' \
+                        --output text); do
+                      aws ec2 modify-network-interface-attribute \
+                        --network-interface-id "$GW_ENI" --no-source-dest-check \
+                        && echo "source/dest check disabled on $GW_I / $GW_ENI"
+                    done
+                  done
+
+                  VPC_ID=$(aws ssm get-parameter --name /workshop/eks-hybrid/vpc-1-id \
+                    --query Parameter.Value --output text)
+                  VPC_CIDR=$(aws ec2 describe-vpcs --vpc-ids "$VPC_ID" \
+                    --query 'Vpcs[0].CidrBlock' --output text)
+                  # The comma MUST be escaped: helm --set reads an unescaped comma as
+                  # a separator between key=value pairs, so a two-route-table list died
+                  # with `failed parsing --set data: key "rtb-0..." has no value`.
+                  RTB_IDS=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" \
+                    --query 'RouteTables[].RouteTableId' --output text | tr '\t' ',' | sed 's/,/\\,/g')
+                  echo "gateway: vpc=$VPC_ID cidr=$VPC_CIDR routeTables=$RTB_IDS"
+                  helm upgrade --install eks-hybrid-nodes-gateway \
+                    oci://public.ecr.aws/eks/eks-hybrid-nodes-gateway \
+                    --version 1.0.0 \
+                    --namespace eks-hybrid-nodes-gateway --create-namespace \
+                    --set vpcCIDR="$VPC_CIDR" \
+                    --set podCIDRs="10.85.0.0/16" \
+                    --set routeTableIDs="$RTB_IDS" \
+                    --set autoMode.enabled=false \
+                    --wait --timeout 10m || echo "GATEWAY_INSTALL_RETRY_NEEDED"
+
+                  # --- Karpenter. replicas=1: there is a single cloud node, and the
+                  # chart's default 2 replicas with anti-affinity would leave one Pending.
+                  helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+                    --version "$KV" --namespace kube-system \
+                    --set "settings.clusterName=$CLUSTER" \
+                    --set "settings.interruptionQueue=$QUEUE" \
+                    --set replicas=1 \
+                    --set controller.resources.requests.cpu=200m \
+                    --set controller.resources.requests.memory=512Mi \
+                    --wait --timeout 10m
+
+                  # --- KEDA (pod-level autoscaling, module 6.4)
+                  helm repo add kedacore https://kedacore.github.io/charts >/dev/null 2>&1
+                  helm repo update >/dev/null 2>&1
+                  helm upgrade --install keda kedacore/keda --version 2.21.0 --namespace keda \
+                    --create-namespace --wait --timeout 10m
+
+                  # --- EC2NodeClass + burst NodePools (module 6 inspects these).
+                  # od-spot-split blueprint: capacity-spread 1 value on-demand,
+                  # 4 values spot = a 20/80 guaranteed/interruptible split.
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: karpenter.k8s.aws/v1
+                  kind: EC2NodeClass
+                  metadata: {name: burst}
+                  spec:
+                    amiFamily: AL2023
+                    amiSelectorTerms: [{alias: al2023@latest}]
+                    # Without this, every burst node gets the gp3 DEFAULTS: 125 MB/s
+                    # throughput and 3000 IOPS. The inference image is 2.67 GB with the
+                    # model baked in, and unpacking it onto a 125 MB/s volume is most of
+                    # the ~4 minutes a fresh node took to serve traffic (measured on
+                    # event fa2c092c - the download from ECR is not the bottleneck, the
+                    # disk is). Burst nodes live for minutes, so the faster volume costs
+                    # cents while cutting the participant's wait roughly in half.
+                    blockDeviceMappings:
+                      - deviceName: /dev/xvda
+                        ebs: {volumeSize: 60Gi, volumeType: gp3, throughput: 600, iops: 4000, deleteOnTermination: true}
+                    role: ${NODEROLE}
+                    subnetSelectorTerms: [${SUBNET_TERMS}]
+                    securityGroupSelectorTerms: [{id: ${CLUSTER_SG}}]
+                    tags: {workshop: eks-hybrid, karpenter-managed: "true"}
+                  ---
+                  apiVersion: karpenter.k8s.aws/v1
+                  kind: EC2NodeClass
+                  metadata: {name: burst-gpu}
+                  spec:
+                    # Bottlerocket Accelerated includes BOTH the NVIDIA driver and
+                    # the Kubernetes device plugin. AL2023 Accelerated includes the
+                    # driver but NOT the plugin; the old AL2023 NodeClass therefore
+                    # launched a GPU node that never advertised nvidia.com/gpu and
+                    # never initialized (self-paced E2E 2026-09-08). This is the
+                    # managed, no-extra-DaemonSet path documented by EKS.
+                    amiFamily: Bottlerocket
+                    amiSelectorTerms: [{alias: bottlerocket@latest}]
+                    # Bottlerocket separates its small control volume from container
+                    # storage. Tune /dev/xvdb, not /dev/xvda: the 2.67 GB model image
+                    # is unpacked here, and that throughput dominates cold start.
+                    blockDeviceMappings:
+                      - deviceName: /dev/xvda
+                        ebs: {volumeSize: 4Gi, volumeType: gp3, deleteOnTermination: true}
+                      - deviceName: /dev/xvdb
+                        ebs: {volumeSize: 60Gi, volumeType: gp3, throughput: 600, iops: 4000, deleteOnTermination: true}
+                    role: ${NODEROLE}
+                    subnetSelectorTerms: [${SUBNET_TERMS}]
+                    securityGroupSelectorTerms: [{id: ${CLUSTER_SG}}]
+                    tags: {workshop: eks-hybrid, karpenter-managed: "true"}
+                  ---
+                  apiVersion: karpenter.sh/v1
+                  kind: NodePool
+                  metadata: {name: cpu-burst-spot}
+                  spec:
+                    template:
+                      metadata:
+                        labels: {workshop-role: burst}
+                      spec:
+                        # TAINTED on purpose. Burst capacity must host burst
+                        # workloads and nothing else. Untainted, any pending
+                        # kube-system pod is enough for Karpenter to buy a node:
+                        # the second CoreDNS replica did exactly that on event
+                        # 66489015 and kept a c7i.large alive at steady state.
+                        taints:
+                          - {key: workshop-role, value: burst, effect: NoSchedule}
+                        nodeClassRef: {group: karpenter.k8s.aws, kind: EC2NodeClass, name: burst}
+                        expireAfter: 168h
+                        requirements:
+                          - {key: kubernetes.io/arch, operator: In, values: [amd64]}
+                          - {key: karpenter.sh/capacity-type, operator: In, values: [spot]}
+                          - {key: karpenter.k8s.aws/instance-family, operator: In, values: [m7i, c7i, m6i, c6i]}
+                          - {key: karpenter.k8s.aws/instance-size, operator: In, values: [large, xlarge, 2xlarge]}
+                          - {key: capacity-spread, operator: In, values: ["2","3","4","5"]}
+                    limits: {cpu: "48"}
+                    disruption: {consolidationPolicy: WhenEmptyOrUnderutilized, consolidateAfter: 60s}
+                  ---
+                  apiVersion: karpenter.sh/v1
+                  kind: NodePool
+                  metadata: {name: cpu-burst-od}
+                  spec:
+                    template:
+                      metadata:
+                        labels: {workshop-role: burst}
+                      spec:
+                        # TAINTED on purpose. Burst capacity must host burst
+                        # workloads and nothing else. Untainted, any pending
+                        # kube-system pod is enough for Karpenter to buy a node:
+                        # the second CoreDNS replica did exactly that on event
+                        # 66489015 and kept a c7i.large alive at steady state.
+                        taints:
+                          - {key: workshop-role, value: burst, effect: NoSchedule}
+                        nodeClassRef: {group: karpenter.k8s.aws, kind: EC2NodeClass, name: burst}
+                        expireAfter: 168h
+                        requirements:
+                          - {key: kubernetes.io/arch, operator: In, values: [amd64]}
+                          - {key: karpenter.sh/capacity-type, operator: In, values: [on-demand]}
+                          - {key: karpenter.k8s.aws/instance-family, operator: In, values: [m7i, c7i, m6i, c6i]}
+                          - {key: karpenter.k8s.aws/instance-size, operator: In, values: [large, xlarge]}
+                          - {key: capacity-spread, operator: In, values: ["1"]}
+                    limits: {cpu: "16"}
+                    disruption: {consolidationPolicy: WhenEmptyOrUnderutilized, consolidateAfter: 60s}
+                  ---
+                  apiVersion: karpenter.sh/v1
+                  kind: NodePool
+                  metadata: {name: gpu-burst}
+                  spec:
+                    template:
+                      metadata:
+                        labels: {workshop-role: burst-gpu}
+                      spec:
+                        nodeClassRef: {group: karpenter.k8s.aws, kind: EC2NodeClass, name: burst-gpu}
+                        expireAfter: 168h
+                        taints:
+                          - {key: nvidia.com/gpu, effect: NoSchedule}
+                        requirements:
+                          - {key: kubernetes.io/arch, operator: In, values: [amd64]}
+                          - {key: karpenter.sh/capacity-type, operator: In, values: [on-demand]}
+                          - {key: karpenter.k8s.aws/instance-family, operator: In, values: [g6]}
+                          - {key: karpenter.k8s.aws/instance-size, operator: In, values: [xlarge, 2xlarge, 4xlarge]}
+                    limits: {nvidia.com/gpu: "1"}
+                    disruption: {consolidationPolicy: WhenEmptyOrUnderutilized, consolidateAfter: 60s}
+                  EOF
+                  kubectl get nodepools 2>&1 | tail -5
+
+                  # --- MetalLB (L2). The on-prem LoadBalancer implementation the
+                  # content calls "pre-installed": inference-lb (10.80.1.240) and
+                  # grafana-lb (10.80.1.241) VIPs depend on it. speaker only on
+                  # hybrid nodes - the VIPs are ARP-announced from the DC network.
+                  # frr disabled: L2/ARP does not need it, and the frr-k8s
+                  # DaemonSet ignores speaker.nodeSelector - it landed on cloud
+                  # nodes, overflowed the t4g baseline and triggered a burst node
+                  # at STEADY STATE (caught in the v5 Dev validation 2026-08-06).
+                  helm repo add metallb https://metallb.github.io/metallb >/dev/null 2>&1
+                  helm repo update >/dev/null 2>&1
+                  helm upgrade --install metallb metallb/metallb --version 0.16.1 \
+                    --namespace metallb-system --create-namespace \
+                    --set speaker.frr.enabled=false \
+                    --set frrk8s.enabled=false \
+                    --set "speaker.nodeSelector.eks\.amazonaws\.com/compute-type=hybrid" \
+                    --set "speaker.tolerations[0].key=node.kubernetes.io/unreachable" \
+                    --set "speaker.tolerations[0].operator=Exists" \
+                    --set "speaker.tolerations[0].effect=NoExecute" \
+                    --wait --timeout 5m || echo "metallb install deferred (no hybrid node yet - association retries in 30min)"
+                  cat <<EOF | kubectl apply -f - || true
+                  apiVersion: metallb.io/v1beta1
+                  kind: IPAddressPool
+                  metadata: {name: dc-pool, namespace: metallb-system}
+                  spec:
+                    addresses: [10.80.1.240-10.80.1.250]
+                  ---
+                  apiVersion: metallb.io/v1beta1
+                  kind: L2Advertisement
+                  metadata: {name: dc-l2, namespace: metallb-system}
+                  spec:
+                    ipAddressPools: [dc-pool]
+                  EOF
+
+                  # --- KEDA ScaledObject (module 6.4 inspects it; the content says
+                  # "the workshop pre-installs KEDA with a ScaledObject"). Degraded
+                  # until modules 3 (deployment) and 5 (prometheus) exist - fine,
+                  # 6.4 runs after both. Query measures pressure on the HYBRID tier
+                  # only: burst replicas counting toward the signal would lower the
+                  # metric and flap the scaler (feedback loop).
+                  #
+                  # CREATE-ONLY, and this guard is load-bearing. This association
+                  # re-runs every 30 minutes, and `kubectl apply` is NOT idempotent
+                  # with respect to participant state here: it restores the
+                  # `paused: "true"` annotation that module 6.4 step 2 tells the
+                  # participant to REMOVE. KEDA reacts to the re-pause by deleting
+                  # the HPA it had created, so steps 3 and 4 stop working with no
+                  # error message anywhere - the participant just finds
+                  # `kubectl get hpa` empty. Measured on event c813d0f5: unpaused
+                  # at 07:25, association re-ran at 07:43, HPA deleted at 07:44:02.
+                  # So: create it when absent, never touch it when present.
+                  if kubectl get scaledobject inference-scaler -n default >/dev/null 2>&1; then
+                  echo "ScaledObject already exists - leaving it alone (the participant may have unpaused it in 6.4)"
+                  else
+                  cat <<'EOF' | kubectl apply -f - || true
+                  apiVersion: keda.sh/v1alpha1
+                  kind: ScaledObject
+                  metadata:
+                    name: inference-scaler
+                    namespace: default
+                    annotations:
+                      # PAUSED on purpose, and this is load-bearing for the module 6
+                      # narrative. Module 6.2 has the participant burst by hand with
+                      # `kubectl scale deployment inference --replicas=10`, and 6.4
+                      # then says "so far you triggered the burst by hand" before
+                      # handing the decision to KEDA. An ACTIVE ScaledObject makes
+                      # that impossible: the HPA it creates owns the replica count and
+                      # reverts a manual scale within about fifteen seconds, so the
+                      # participant watches the replicas snap back to the minimum and
+                      # concludes the burst is broken. Measured exactly that way on
+                      # event 158b640d. The object still exists from the start, so
+                      # preflight can report it and 6.4 step 1 can inspect it - it
+                      # just does not act until 6.4 step 2 unpauses it.
+                      autoscaling.keda.sh/paused: "true"
+                  spec:
+                    scaleTargetRef: {name: inference}
+                    minReplicaCount: 2
+                    maxReplicaCount: 12
+                    advanced:
+                      horizontalPodAutoscalerConfig:
+                        behavior:
+                          scaleDown:
+                            # This is what actually produces the ~5 minute wait
+                            # before scale-in, and module 6.4 step 2 teaches it.
+                            # NOT cooldownPeriod: that field only applies when
+                            # minReplicaCount is 0, and KEDA prints a Warning
+                            # saying so ("CooldownPeriod is configured but is not
+                            # relevant"). cooldownPeriod was set here before and
+                            # was inert, which made the page explain the wrong
+                            # mechanism while the tool contradicted it on screen.
+                            stabilizationWindowSeconds: 300
+                    # NO pollingInterval, and this absence is deliberate - do not
+                    # "restore" it. It was removed alongside cooldownPeriod, then
+                    # briefly added back on the reasoning that it is the trigger's
+                    # Prometheus query interval and therefore always live. That
+                    # reasoning is wrong, and KEDA says so in the same breath it
+                    # uses for cooldownPeriod. Measured on event fc423251, on the
+                    # very command that unpauses the object in 6.4 step 2:
+                    #   Warning: PollingInterval is configured but is not relevant.
+                    #   PollingInterval is only relevant when minReplicaCount = 0
+                    #   or idleReplicaCount = 0 or useCachedMetrics is enabled
+                    # minReplicaCount is 2 here, so with an HPA driving the query
+                    # cadence the field does nothing except print that warning at
+                    # the participant, which is exactly the defect that removing
+                    # cooldownPeriod fixed.
+                    triggers:
+                      - type: prometheus
+                        # VALUE, not the default AverageValue. The threshold is an
+                        # absolute latency in seconds, so letting the HPA divide it by
+                        # the replica count would make the effective threshold
+                        # `5 x replicas` and the scaler SELF-LIMITING: every replica
+                        # added makes the next one harder to justify. Measured on event
+                        # c813d0f5 with the previous ratio query: 3.5 / 3 replicas =
+                        # 1.167 matched the HPA reading exactly, the deployment froze
+                        # at 3-4 replicas and Karpenter never provisioned.
+                        metricType: Value
+                        metadata:
+                          # HEADLESS service, FQDN. Two field-found reasons:
+                          # (1) FQDN not short name - the short form depends on the
+                          # search path and produced intermittent "no such host" on
+                          # event 66489015. (2) HEADLESS not ClusterIP - a ClusterIP
+                          # whose only endpoints sit on hybrid nodes is unreachable
+                          # from cloud pods (KEDA timed out on every query, event
+                          # 16e245fc); headless resolves to the pod IP, which the
+                          # gateway routes. Same class as inference-headless.
+                          serverAddress: http://prometheus-headless.onprem-monitoring.svc.cluster.local:9090
+                          # p95 LATENCY of the on-premises tier, not queue depth.
+                          # The obvious signal here is the queue
+                          # (ollama_requests_waiting / ollama_requests_running) and it
+                          # was what this used, but it reads 0 under load: measured 0
+                          # with 10, 20, 30 and 60 traffic generators on event c813d0f5.
+                          # The gauge is NOT broken - it is structurally incapable of
+                          # moving here, and the sidecar arithmetic says why:
+                          #   running = min(inflight, PARALLEL)
+                          #   waiting = max(0, inflight - PARALLEL)   # PARALLEL = 2
+                          # `inflight` is connections open at scrape time, so `waiting`
+                          # only leaves 0 above 2 CONCURRENT requests. With 10 generators
+                          # on a ~20s cycle and a p95 of 1.6-3.2s, expected concurrency is
+                          # 10 x 3.2 / 20 = 1.6 - under the threshold of 2, permanently.
+                          # The ~20s was the generator's own sleep, not queueing. So do
+                          # not "fix" the gauge or the sidecar: queue depth cannot be the
+                          # signal until OLLAMA_NUM_PARALLEL drops or the load is made
+                          # genuinely concurrent.
+                          # Latency has none of that dependency, it is what the caller
+                          # feels, and page 4.2 already plots it.
+                          #
+                          # The trailing guard exists because histogram_quantile over
+                          # all-zero rates returns NaN, not 0 - so with the load
+                          # generators stopped for 2 minutes KEDA reads NaN and the HPA
+                          # surfaces it, in the same page that tells the participant to
+                          # read the HPA. Measured with promtool, three ways:
+                          #   bucket rates flat (idle)   -> bare query NaN, guard 0
+                          #   bucket series ABSENT       -> guard EMPTY, so the HPA still
+                          #                                 reports failure loudly
+                          #   under load                 -> guard 1.97, identical to bare
+                          # `or vector(0)` ALONE DOES NOT WORK and looks like it does:
+                          # `or` only fills in when the left side has NO samples, and
+                          # NaN IS a sample, so it passes straight through (measured -
+                          # still NaN). The `>= 0` is what drops NaN, because a
+                          # comparison against NaN is false, which empties the vector and
+                          # lets `or` fire. The `and on() count(...) > 0` is what keeps
+                          # this honest: 0 is only substituted when the counter EXISTS,
+                          # so a dead sidecar stays an error instead of reading as
+                          # "no demand".
+                          query: (histogram_quantile(0.95, sum(rate(ollama_request_duration_seconds_bucket{node_type="hybrid"}[2m])) by (le)) >= 0) or (vector(0) and on() (count(ollama_request_duration_seconds_count{node_type="hybrid"}) > 0))
+                          # 1s, CALIBRATED on event c813d0f5, not guessed. Measured
+                          # p95 on this hardware: 0.475-0.497s at rest (remarkably
+                          # stable) and 1.6-3.2s under the 10 traffic generators that
+                          # module 6.4 step 3 starts. 1 sits ~2x above the idle floor
+                          # and below the loaded minimum, so it is crossed reliably
+                          # under load and never at rest - and it is an exact
+                          # histogram bucket, so the quantile is not interpolated at
+                          # the decision point. A first attempt at 5 was NEVER crossed
+                          # (peak 3.17), which is why this number is measured.
+                          threshold: "1"
+                          # NOT setting activationThreshold: it only governs the 0->N
+                          # transition and minReplicaCount is 2, so it would be an
+                          # inert number that the participant reads in 6.4 step 1 and
+                          # tries to make sense of. Same reason cooldownPeriod is gone.
+                  EOF
+                  fi
+
+                  # --- Terminal verification: this block is the step's verdict.
+                  # Several installs above fall through on purpose so the rest still
+                  # runs (GATEWAY_INSTALL_RETRY_NEEDED, the MetalLB deferral, `|| true`),
+                  # and without `set -e` the step used to exit with the status of its
+                  # LAST command, the ScaledObject guard, so a half-installed cluster
+                  # still reported Success. Every Helm release the modules use must be
+                  # `deployed` and every burst NodePool Ready, or the command fails and
+                  # names what is not. At create time that fails the phase with the
+                  # names in the stack status reason; on a 30-minute run it marks the
+                  # association and the next run retries. Bounded at 180 s, so a release
+                  # mid-operation (another upgrade in flight) or a NodePool still
+                  # resolving its EC2NodeClass can converge first. Tracing goes off so
+                  # the ERROR line is the tail of stderr, which is what the runner shows.
+                  { set +x; } 2>/dev/null
+                  REQUIRED_RELEASES="kube-system/cilium eks-hybrid-nodes-gateway/eks-hybrid-nodes-gateway kube-system/karpenter keda/keda metallb-system/metallb"
+                  REQUIRED_NODEPOOLS="cpu-burst-spot cpu-burst-od gpu-burst"
+                  VERIFY_DEADLINE=$((SECONDS + 180))
+                  while :; do
+                    NOT_READY=""
+                    for REL in $REQUIRED_RELEASES; do
+                      REL_STATUS=$(helm status "${REL#*/}" -n "${REL%%/*}" -o json 2>/dev/null | jq -r '.info.status // empty' 2>/dev/null)
+                      [ "$REL_STATUS" = deployed ] || NOT_READY="$NOT_READY helm:${REL}=${REL_STATUS:-missing}"
+                    done
+                    for NP in $REQUIRED_NODEPOOLS; do
+                      NP_READY=$(kubectl get nodepool "$NP" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+                      [ "$NP_READY" = True ] || NOT_READY="$NOT_READY nodepool:${NP}=${NP_READY:-missing}"
+                    done
+                    [ -z "$NOT_READY" ] && break
+                    if [ "$SECONDS" -ge "$VERIFY_DEADLINE" ]; then
+                      echo "ERROR: clusterBootstrap verification failed after 180 s, not ready:${NOT_READY}" >&2
+                      exit 1
+                    fi
+                    echo "clusterBootstrap verification waiting for:${NOT_READY}"
+                    sleep 15
+                  done
+                  echo "clusterBootstrap verification passed: cilium, eks-hybrid-nodes-gateway, karpenter, keda, metallb deployed; cpu-burst-spot, cpu-burst-od, gpu-burst Ready"
+
+          - action: aws:runShellScript
+            name: installAssets
+            inputs:
+              timeoutSeconds: '300'
+              runCommand:
+                - |
+                  # Downloads the participant assets (manifests, scripts, dashboards)
+                  # from the Workshop Studio assets bucket to ~/workshop/ and resolves
+                  # the provisioning-time placeholders. Idempotent: re-synced and
+                  # re-rendered on every association run (assets stay fresh).
+                  set -uxo pipefail   # NOT -e: cluster may not exist yet, must not fail the association
+                  BUCKET="{{ AssetsBucketNameParam }}"
+                  PREFIX="{{ AssetsBucketPrefixParam }}"
+                  if [ -z "$BUCKET" ]; then echo "no assets bucket configured - skipping"; exit 0; fi
+                  command -v envsubst >/dev/null || dnf install -y -q gettext
+                  export HOME=/root
+                  REGION=$(curl -sH "X-aws-ec2-metadata-token: $(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')" http://169.254.169.254/latest/meta-data/placement/region)
+                  WS="/home/ec2-user/workshop"
+                  aws s3 sync "s3://${BUCKET}/${PREFIX}workshop/" "$WS/" --delete --exact-timestamps
+                  # ---- placeholder values. INFERENCE_REGISTRY: the images CodeBuild
+                  # built into THIS account's ECR. There is no third-party fallback:
+                  # the fallback parameter also names this account's ECR, so the
+                  # manifests point there even before the build lands, and the pods
+                  # pull once it does. A failed build is reported by the preflight.
+                  LOCAL_REG=$(aws ssm get-parameter --name "/workshop/{{ WorkshopNameParam }}/inference-registry-local" --query Parameter.Value --output text 2>/dev/null || echo "")
+                  FALLBACK_REG=$(aws ssm get-parameter --name "/workshop/{{ WorkshopNameParam }}/inference-registry-fallback" --query Parameter.Value --output text 2>/dev/null || echo "$LOCAL_REG")
+                  export INFERENCE_REGISTRY="$FALLBACK_REG"
+                  if [ -n "$LOCAL_REG" ] && \
+                     aws ecr describe-images --repository-name eks-hybrid-workshop/ollama-llama32-1b --query 'imageDetails[0].imageDigest' --output text >/dev/null 2>&1 && \
+                     aws ecr describe-images --repository-name eks-hybrid-workshop/ollama-llama31-8b --query 'imageDetails[0].imageDigest' --output text >/dev/null 2>&1; then
+                    export INFERENCE_REGISTRY="$LOCAL_REG"
+                  fi
+                  echo "inference registry: $INFERENCE_REGISTRY"
+                  export AWS_REGION="$REGION"
+                  export EKS_ENDPOINT=$(aws eks describe-cluster --name "{{ ClusterName }}" --region "$REGION" --query cluster.endpoint --output text 2>/dev/null || echo "https://cluster-pending.eks.${REGION}.amazonaws.com")
+                  export AMP_REMOTE_WRITE_URL=$(aws ssm get-parameter --name "/workshop/{{ WorkshopNameParam }}/amp-remote-write-url" --query Parameter.Value --output text 2>/dev/null || echo "")
+                  # cloud node InternalIPs -> YAML list items for the ICMP probe job
+                  export CLOUD_NODE_TARGETS=$(kubectl --kubeconfig /root/.kube/config get nodes -o json 2>/dev/null | \
+                    python3 -c "import json,sys; d=json.load(sys.stdin); ips=[a['address'] for n in d['items'] if n['metadata'].get('labels',{}).get('eks.amazonaws.com/compute-type')!='hybrid' for a in n['status']['addresses'] if a['type']=='InternalIP']; print('\n'.join(f'              - {ip}' for ip in ips))" 2>/dev/null || echo "              - 10.42.1.100")
+                  # dashboard JSON indented for the ConfigMap block scalar (single source of truth)
+                  export DASHBOARD_JSON=$(sed 's/^/    /' "$WS/dashboards/hybrid-nodes.json")
+                  # ---- render: EXPLICIT variable list only. A bare envsubst would
+                  # clobber shell vars in the client scripts ($SEQ, ${TS}) and the
+                  # $1 regex references in the prometheus relabel configs.
+                  for f in "$WS"/manifests/*.yaml; do
+                    envsubst '${INFERENCE_REGISTRY} ${AWS_REGION} ${EKS_ENDPOINT} ${AMP_REMOTE_WRITE_URL} ${CLOUD_NODE_TARGETS} ${DASHBOARD_JSON}' < "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+                  done
+                  chmod +x "$WS"/scripts/*.sh 2>/dev/null
+                  chown -R ec2-user:ec2-user "$WS"
+                  echo "ASSETS_OK: $(find "$WS" -type f | wc -l) files in ~/workshop/"
+
+          - action: aws:runShellScript
+            name: workshopBootstrap
+            inputs:
+              timeoutSeconds: '300'
+              runCommand:
+                - |
+                  set -uxo pipefail   # NOT -e: cluster may not exist yet, must not fail the association
+                  REGION=$(curl -sH "X-aws-ec2-metadata-token: $(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')" http://169.254.169.254/latest/meta-data/placement/region)
+                  # kubeconfig (tolerates a cluster that is still being created)
+                  sudo -u ec2-user aws eks update-kubeconfig --region "$REGION" --name "{{ ClusterName }}" || \
+                    echo "cluster {{ ClusterName }} not available yet - participants can re-run this command"
+                  # workshop env file referenced by the content pages
+                  cat > /home/ec2-user/workshop-env.sh <<EOF
+                  export AWS_REGION=${REGION}
+                  # Never drop a participant into `less` in the middle of a copied
+                  # command. AWS CLI v2 enables the pager by default; in the browser
+                  # IDE it looked like the command hung until the tester pressed q.
+                  export AWS_PAGER=""
+                  export CLUSTER_NAME={{ ClusterName }}
+                  export HYBRID_NODE_1_IP=10.80.1.11
+                  export HYBRID_NODE_2_IP=10.80.1.12
+                  EOF
+                  chown ec2-user:ec2-user /home/ec2-user/workshop-env.sh
+                  grep -q workshop-env /home/ec2-user/.bashrc || \
+                    echo 'source ~/workshop-env.sh 2>/dev/null' >> /home/ec2-user/.bashrc
+                  # SSH keypair for the hybrid node VMs (key-based auth only - the
+                  # cloud-init seeds have no password). Pubkey published to SSM so
+                  # the Hyper-V automation injects it into the seeds at VM creation.
+                  if [ ! -f /home/ec2-user/.ssh/id_ed25519 ]; then
+                    sudo -u ec2-user ssh-keygen -t ed25519 -N '' -f /home/ec2-user/.ssh/id_ed25519 -C workshop-ide
+                  fi
+                  # The first module-2 SSH must not stop on an unexplained
+                  # host-key prompt. accept-new preserves protection against a
+                  # CHANGED key while accepting these newly created lab VMs once.
+                  cat > /home/ec2-user/.ssh/config <<'EOF'
+                  Host 10.80.1.*
+                    StrictHostKeyChecking accept-new
+                    UserKnownHostsFile ~/.ssh/known_hosts
+                  EOF
+                  chmod 600 /home/ec2-user/.ssh/config
+                  chown -R ec2-user:ec2-user /home/ec2-user/.ssh
+                  aws ssm put-parameter --region "$REGION" \
+                    --name "/workshop/{{ WorkshopNameParam }}/ide-ssh-pubkey" \
+                    --type String --overwrite \
+                    --value "$(cat /home/ec2-user/.ssh/id_ed25519.pub)" || true
+                  # health gate: wait for code-server to answer locally (up to 60s)
+                  for i in $(seq 1 12); do
+                    if curl -sf -o /dev/null http://localhost:8081/healthz || curl -sf -o /dev/null http://localhost:8081/; then
+                      echo "IDE_READY"; exit 0
+                    fi
+                    sleep 5
+                  done
+                  echo "IDE code-server not answering on loopback :8081 after 60s"; systemctl status code-server@ec2-user --no-pager | tail -20; exit 1
+
+  # ------------------------------------------------------------ EC2 + network
+  IdeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: code-server origin - CloudFront only
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourcePrefixListId: !FindInMap [CloudFrontPrefixList, !Ref 'AWS::Region', PrefixList]
+          Description: CloudFront origin-facing servers only
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0}
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-ide-sg'}]
+
+  IdeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      MetadataOptions:
+        # Explicit, not inherited. AL2023 already ships imds-support v2.0, so the
+        # running instances measured as HttpTokens=required before this was added -
+        # but that is an AMI DEFAULT, and a future AMI or a copied template silently
+        # loses it. Declaring it makes IMDSv2 a property of the workshop rather than
+        # of the image. Verified live on event a135e903: every IMDS call in the
+        # bootstrap already sends the token header, IMDSv1 returns 401, and kubectl,
+        # the IDE credentials, code-server and both VPN tunnels stayed healthy.
+        HttpEndpoint: enabled
+        HttpTokens: required
+        # One hop: nothing on this instance runs in a container, so no caller
+        # sits behind a network hop that would need a token response.
+        HttpPutResponseHopLimit: 1
+      ImageId: !Ref LatestAl2023Ami
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref IdeInstanceProfile
+      SubnetId: !Ref PublicSubnetId
+      SecurityGroupIds: [!Ref IdeSecurityGroup]
+      BlockDeviceMappings:
+        # Encrypted explicitly (the account's default EBS key): this volume holds
+        # the VM SSH private key and the nginx config with the IDE token.
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: !Ref RootVolumeSize, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+      Tags:
+        - {Key: Name, Value: !Sub '${WorkshopName}-ide'}
+        - {Key: workshop-role, Value: ide}   # State Manager targets this tag
+
+  # State Manager association: configures the instance as soon as SSM registers it
+  IdeSetupAssociation:
+    Type: AWS::SSM::Association
+    DependsOn: IdeInstance
+    Properties:
+      AssociationName: !Sub '${WorkshopName}-ide-setup'
+      Name: !Ref IdeSetupDocument
+      Targets:
+        - Key: tag:workshop-role
+          Values: [ide]
+      Parameters:
+        IdePasswordSecretId: [!GetAtt IdePasswordSecret.SecretName]
+        ClusterName: [!Ref EKSClusterName]
+        CodeServerVersion: [!Ref CodeServerVersion]
+        WorkshopNameParam: [!Ref WorkshopName]
+        AssetsBucketNameParam: [!Ref AssetsBucketName]
+        AssetsBucketPrefixParam: [!Ref AssetsBucketPrefix]
+        ArtifactBucketName: [!Ref SsmOutputBucket]
+      # Re-applies desired state (idempotent steps) - self-healing IDE
+      # Full step output in CloudWatch: SSM truncates inline output at ~2.5KB,
+      # which hides real errors (learned the hard way during validation).
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !Ref SsmOutputBucket
+          OutputS3KeyPrefix: ide-setup
+      ScheduleExpression: 'rate(30 minutes)'
+      MaxConcurrency: '1'
+      MaxErrors: '1'
+
+  # Access logging is enabled INTO THIS SAME BUCKET under a prefix. A separate
+  # log bucket would just move the finding (and outlive its purpose), and the
+  # Workshop Studio scanner does NOT honour the Metadata.checkov.skip block that
+  # was here before (verified 2026-08-07: the finding came back). Everything in
+  # here - command output and access logs alike - expires with the 7-day
+  # lifecycle rule, and the account is destroyed after the event.
+  # Emptied on stack DELETE by the custom resource below. Without it, deleting
+  # the stack fails outright with "The following resource(s) failed to delete:
+  # [SsmOutputBucket]" - CloudFormation refuses to remove a non-empty bucket, and
+  # this one always has content (SSM command output plus its own access logs).
+  # Confirmed by tearing the Dev environment down on 2026-08-08. It matters most
+  # for the SELF-PACED path, where the cleanup instructions are "delete the
+  # stack": that would have left every user with a stuck stack.
+  # Encryption is stated explicitly (SSE-S3; the Hyper-V host reads the base image
+  # from here with S3 permissions only, so no KMS key is involved). Versioning
+  # protects the base image and the command output from an overwrite; noncurrent
+  # versions expire after one day, and the delete-time emptier below removes every
+  # version.
+  SsmOutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      LoggingConfiguration:
+        LogFilePrefix: access-logs/
+      BucketName: !Sub '${WorkshopName}-ssm-out-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration: {NoncurrentDays: 1}
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+
+  SsmOutputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SsmOutputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt SsmOutputBucket.Arn
+              - !Sub '${SsmOutputBucket.Arn}/*'
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+
+  IdeArtifactBucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/ide-artifact-bucket'
+      Type: String
+      Value: !Ref SsmOutputBucket
+      Description: Account-local bucket containing the IDE-converted Hyper-V base image
+
+  # Edge step of the one-click sign-in: moves ?tkn=<token> into an HttpOnly
+  # cookie and redirects to a clean URL, so the token leaves the address bar on
+  # the first hit. It holds NO secret and decides nothing: nginx on the instance
+  # compares the cookie with the token in Secrets Manager (configureIde). Here a
+  # request without a well-formed cookie is turned away early with 403.
+  EdgeAuthFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${WorkshopName}-ide-edge-auth'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Moves the workshop IDE sign-in token from the URL into a cookie
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        var COOKIE = 'ws_ide_auth';
+        var WELL_FORMED = /^[A-Za-z0-9]{16,128}$/;
+        function handler(event) {
+          var req = event.request;
+          var qs = req.querystring || {};
+          var cookies = req.cookies || {};
+          // sign-in link: store the token in the cookie and redirect to a clean URL
+          if (qs.tkn && WELL_FORMED.test(qs.tkn.value)) {
+            return {
+              statusCode: 302,
+              statusDescription: 'Found',
+              headers: { 'location': { value: '/' } },
+              cookies: {
+                'ws_ide_auth': {
+                  value: qs.tkn.value,
+                  attributes: 'Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=43200'
+                }
+              }
+            };
+          }
+          // the origin checks the value; the edge only requires that one is present
+          if (cookies[COOKIE] && WELL_FORMED.test(cookies[COOKIE].value)) {
+            return req;
+          }
+          return {
+            statusCode: 403,
+            statusDescription: 'Forbidden',
+            headers: { 'content-type': { value: 'text/html' } },
+            body: '<h2>Workshop IDE</h2><p>Open the one-click sign-in link: the IdeUrl stack output followed by ?tkn= and the value of the secret named in the IdeTokenSecret output.</p>'
+          };
+        }
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_86
+            comment: 'Access logging is enabled with standard logging v2 (IdeAccessLogDelivery, CloudWatch Logs, us-east-1). The legacy Logging property this check reads would log the sign-in token in cs-uri-query'
+      cfn_nag:
+        rules_to_suppress:
+          - id: W10
+            reason: 'Access logging is enabled with standard logging v2 (IdeAccessLogDelivery); the legacy Logging property would log the sign-in token in cs-uri-query'
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        IPV6Enabled: true
+        Comment: !Sub '${WorkshopName} code-server IDE'
+        DefaultCacheBehavior:
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad   # CachingDisabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
+          TargetOriginId: !Sub '${AWS::StackName}-ide'
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt EdgeAuthFunction.FunctionMetadata.FunctionARN
+        Origins:
+          - Id: !Sub '${AWS::StackName}-ide'
+            DomainName: !GetAtt IdeInstance.PublicDnsName
+            CustomOriginConfig:
+              HTTPPort: 8080
+              OriginProtocolPolicy: http-only
+            OriginCustomHeaders:
+              - HeaderName: X-Workshop-Origin-Secret
+                HeaderValue: !GetAtt IdePasswordSecret.OriginSecret
+
+  # ---- CloudFront access logs: standard logging v2 into a CloudWatch Logs log
+  # group this stack owns (7-day retention, deleted with the stack, so no log
+  # bucket can block the delete). The FIELD LIST is the control: the sign-in
+  # token travels once in the query string (?tkn=) and then in the ws_ide_auth
+  # cookie, so cs-uri-query, cs(Cookie) and cs(Referer) are never delivered, and
+  # neither is the function log data. Every field below is request metadata.
+  # Checkov CKV_AWS_86 and cfn_nag W10 look only at the legacy
+  # DistributionConfig.Logging property, which logs the full query string, hence
+  # the suppressions on the distribution.
+  IdeAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: InUsEast1
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '${WorkshopName}-ide-cloudfront-access'
+      RetentionInDays: 7
+
+  IdeAccessLogSource:
+    Type: AWS::Logs::DeliverySource
+    Condition: InUsEast1
+    Properties:
+      Name: !Sub '${WorkshopName}-ide-cloudfront'
+      LogType: ACCESS_LOGS
+      ResourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  IdeAccessLogDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Condition: InUsEast1
+    Properties:
+      Name: !Sub '${WorkshopName}-ide-cloudfront-cwl'
+      OutputFormat: json
+      DestinationResourceArn: !GetAtt IdeAccessLogGroup.Arn
+
+  IdeAccessLogDelivery:
+    Type: AWS::Logs::Delivery
+    Condition: InUsEast1
+    DependsOn: IdeAccessLogSource
+    Properties:
+      DeliverySourceName: !Sub '${WorkshopName}-ide-cloudfront'
+      DeliveryDestinationArn: !GetAtt IdeAccessLogDestination.Arn
+      RecordFields:
+        - date
+        - time
+        - timestamp(ms)
+        - x-edge-location
+        - x-edge-request-id
+        - c-ip
+        - c-port
+        - c-country
+        - asn
+        - x-forwarded-for
+        - cs-method
+        - cs-protocol
+        - cs-protocol-version
+        - cs(Host)
+        - x-host-header
+        - cs-uri-stem
+        - cs(User-Agent)
+        - cs-bytes
+        - sc-status
+        - sc-bytes
+        - sc-content-type
+        - sc-content-len
+        - time-taken
+        - time-to-first-byte
+        - origin-fbl
+        - origin-lbl
+        - x-edge-result-type
+        - x-edge-response-result-type
+        - x-edge-detailed-result-type
+        - ssl-protocol
+        - ssl-cipher
+        - cache-behavior-path-pattern
+
+  # ---- Empties SsmOutputBucket on stack delete (see the note on the bucket).
+  # cfnresponse does NOT exist in the python3.13 runtime - own respond() below,
+  # same pattern as every other custom resource in this workshop.
+  EmptyBucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+        - PolicyName: empty-ssm-output-bucket
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:ListBucket', 's3:ListBucketVersions', 's3:PutBucketLogging']
+                Resource: !GetAtt SsmOutputBucket.Arn
+              - Effect: Allow
+                Action: ['s3:DeleteObject', 's3:DeleteObjectVersion']
+                Resource: !Sub '${SsmOutputBucket.Arn}/*'
+
+  EmptyBucketFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt EmptyBucketRole.Arn
+      Code:
+        ZipFile: |
+          import json, time, urllib.request, boto3
+          def respond(event, ctx, status, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f"see CloudWatch log stream {ctx.log_stream_name}",
+                  'PhysicalResourceId': event.get('PhysicalResourceId') or ctx.log_stream_name,
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'], 'Data': {}}).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                                           headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req)
+          def handler(event, ctx):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      bucket = event['ResourceProperties']['Bucket']
+                      client = boto3.client('s3')
+                      # Stop the bucket from logging its own cleanup writes, then
+                      # drain versions and delete markers until it stays empty.
+                      client.put_bucket_logging(Bucket=bucket, BucketLoggingStatus={})
+                      for attempt in range(5):
+                          boto3.resource('s3').Bucket(bucket).object_versions.delete()
+                          time.sleep(2)
+                          page = client.list_object_versions(Bucket=bucket)
+                          remaining = len(page.get('Versions', [])) + len(page.get('DeleteMarkers', []))
+                          if not remaining and not page.get('IsTruncated'):
+                              print(f'emptied {bucket} after {attempt + 1} pass(es)')
+                              break
+                      else:
+                          raise RuntimeError(f'{bucket} still has object versions after 5 passes')
+                  respond(event, ctx, 'SUCCESS')
+              except Exception as e:
+                  print('empty-bucket error:', e)
+                  respond(event, ctx, 'FAILED', reason=str(e))
+
+  EmptySsmOutputBucket:
+    Type: Custom::EmptyBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyBucketFn.Arn
+      Bucket: !Ref SsmOutputBucket
+
+Outputs:
+  # The sign-in token is deliberately NOT an output: DescribeStacks is a
+  # read-only call, and the token opens a shell with this stack's IDE role.
+  IdeUrl:
+    Description: 'Browser IDE address. One-click sign-in = this URL + ?tkn= + the value of the IdeTokenSecret secret (README, step 4)'
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}/'
+  IdeTokenSecret:
+    Description: 'Secrets Manager secret that holds the IDE sign-in token'
+    Value: !GetAtt IdePasswordSecret.SecretName
+  IdeInstanceId:
+    Description: 'IDE EC2 instance id (SSM Session Manager works for troubleshooting)'
+    Value: !Ref IdeInstance
+  SetupAssociationId:
+    Description: 'SSM association - check execution history here if the IDE is not ready'
+    Value: !Ref IdeSetupAssociation

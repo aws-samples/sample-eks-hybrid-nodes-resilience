@@ -1,0 +1,42 @@
+#cloud-config
+# hybrid-node-2: deliberately a PLAIN Ubuntu server (network + IMDS block only).
+# Participants join it to the cluster BY HAND in Module 2 - that is the whole
+# point of the workshop. Do NOT add nodeadm/join automation here; the pre-joined
+# reference node is hybrid-node-1 (user-data-1.yaml).
+hostname: hybrid-node-2
+bootcmd:
+  # A real data center has no IMDS - block it BEFORE any agent starts, so no VM can borrow the host's identity
+  - iptables -I OUTPUT -d 169.254.169.254 -j DROP
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    # key-based SSH only - no password on the VM. The IDE's public key is
+    # injected by the Hyper-V automation (CreateVMs step) from SSM.
+    ssh_authorized_keys:
+      - __IDE_SSH_PUBKEY__
+write_files:
+  - path: /etc/netplan/60-static.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          eth0:
+            match: {name: "e*"}
+            addresses: [10.80.1.12/16]
+            routes: [{to: default, via: 10.80.0.1}]
+            nameservers: {addresses: [8.8.8.8]}
+  - path: /etc/systemd/system/block-imds.service
+    content: |
+      [Unit]
+      Description=Block IMDS (simulated on-prem has no metadata service)
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/sbin/iptables -I OUTPUT -d 169.254.169.254 -j DROP
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - netplan apply
+  - systemctl enable block-imds.service

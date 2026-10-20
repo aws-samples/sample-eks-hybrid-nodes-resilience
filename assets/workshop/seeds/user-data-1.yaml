@@ -1,0 +1,136 @@
+#cloud-config
+# hybrid-node-1: PRE-JOINED node. Joins the EKS cluster automatically at first
+# boot so participants arrive with a working reference (didactic design: living
+# example of the finished state + safety net for modules 3-6). The placeholder
+# values are injected by the Hyper-V SSM Automation (CreateVMs step) from the
+# activation it creates - see provisioning/ssm/hyperv-setup-automation.yaml.
+# hybrid-node-2 (user-data-2.yaml) stays a plain Ubuntu server on purpose:
+# participants join it by hand in Module 2.
+hostname: hybrid-node-1
+bootcmd:
+  # A real data center has no IMDS - block it BEFORE any agent starts, so no VM can borrow the host's identity
+  - iptables -I OUTPUT -d 169.254.169.254 -j DROP
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    # key-based SSH only - no password on the VM. The IDE's public key is
+    # injected by the Hyper-V automation (CreateVMs step) from SSM.
+    ssh_authorized_keys:
+      - __IDE_SSH_PUBKEY__
+write_files:
+  - path: /etc/netplan/60-static.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          eth0:
+            match: {name: "e*"}
+            addresses: [10.80.1.11/16]
+            routes: [{to: default, via: 10.80.0.1}]
+            nameservers: {addresses: [8.8.8.8]}
+  - path: /etc/systemd/system/block-imds.service
+    content: |
+      [Unit]
+      Description=Block IMDS (simulated on-prem has no metadata service)
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/sbin/iptables -I OUTPUT -d 169.254.169.254 -j DROP
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/nodeadm/nodeConfig.yaml
+    permissions: '0600'
+    content: |
+      apiVersion: node.eks.aws/v1alpha1
+      kind: NodeConfig
+      spec:
+        cluster:
+          name: __CLUSTER_NAME__
+          region: __AWS_REGION__
+        hybrid:
+          ssm:
+            activationId: __ACTIVATION_ID__
+            activationCode: __ACTIVATION_CODE__
+        kubelet:
+          config:
+            # image-cache guardrails - page 3.2 explains and verifies these
+            imageGCHighThresholdPercent: 90
+            imageGCLowThresholdPercent: 80
+            imageMinimumGCAge: 168h
+  # Self-join as a SYSTEMD UNIT, not a cloud-init runcmd. Three reasons, all
+  # learned the hard way in the v5 e2e (2026-08-06):
+  #   1. runcmd is synchronous - a retry loop there blocks cloud-init for
+  #      minutes and, if it gives up, nothing ever retries.
+  #   2. the download raced the network: curl failed while the VPN/routing on
+  #      the host was still settling, and the script marched on to `init` with
+  #      no binary ("nodeadm: command not found" x20).
+  #   3. Restart=on-failure makes the node join EVENTUALLY without human
+  #      intervention, which is exactly what a "pre-joined reference node" needs.
+  - path: /usr/local/bin/join-cluster.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # Idempotent self-join. Exits 0 only when the kubelet is actually up, so
+      # systemd keeps retrying until the node is really part of the cluster.
+      set -uo pipefail
+      exec >> /var/log/join-cluster.log 2>&1
+      echo "=== join attempt $(date -Is) ==="
+
+      # 0. already joined? nothing to do (survives reboots and re-runs)
+      if systemctl is-active --quiet kubelet; then
+        echo "kubelet already active - nothing to do"; exit 0
+      fi
+
+      # 1. wait for real internet egress (the DC path goes through the Hyper-V
+      #    host and the VPN appliance, which may still be converging)
+      for i in $(seq 1 30); do
+        if curl -fsS --max-time 10 -o /dev/null https://hybrid-assets.eks.amazonaws.com/; then
+          echo "egress OK after ${i} probe(s)"; break
+        fi
+        echo "no egress yet (probe ${i}/30)"; sleep 10
+      done
+
+      # 2. install nodeadm - VERIFY the binary before using it
+      if ! command -v nodeadm >/dev/null; then
+        curl -fsSL --retry 5 --retry-delay 10 --retry-connrefused \
+          -o /tmp/nodeadm 'https://hybrid-assets.eks.amazonaws.com/releases/latest/bin/linux/amd64/nodeadm' \
+          || { echo "nodeadm DOWNLOAD failed - systemd will retry"; exit 1; }
+        install -m 0755 /tmp/nodeadm /usr/local/bin/nodeadm
+      fi
+      command -v nodeadm >/dev/null || { echo "nodeadm still missing - retry"; exit 1; }
+
+      # 3. install the EKS artifacts (idempotent; skipped once kubelet exists)
+      if [ ! -x /usr/bin/kubelet ] && [ ! -x /usr/local/bin/kubelet ]; then
+        nodeadm install 1.36 --credential-provider ssm || { echo "nodeadm install failed - retry"; exit 1; }
+      fi
+
+      # 4. join. The SSM activation is consumed here; a 403 on eks:ListAccessEntries
+      #    means the hybrid nodes role is missing that permission (see the cluster
+      #    template) - not something a retry fixes, but retrying is harmless.
+      nodeadm init -c file:///etc/nodeadm/nodeConfig.yaml || { echo "nodeadm init failed - retry"; exit 1; }
+
+      systemctl is-active --quiet kubelet || { echo "kubelet not active after init - retry"; exit 1; }
+      echo "JOIN_OK: kubelet active"
+  - path: /etc/systemd/system/eks-hybrid-join.service
+    content: |
+      [Unit]
+      Description=Join this machine to the EKS cluster as a hybrid node
+      After=network-online.target cloud-final.service
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/bin/join-cluster.sh
+      Restart=on-failure
+      RestartSec=30
+      TimeoutStartSec=1800
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - netplan apply
+  - systemctl enable block-imds.service
+  - systemctl daemon-reload
+  - systemctl enable --no-block eks-hybrid-join.service
+  - systemctl start --no-block eks-hybrid-join.service

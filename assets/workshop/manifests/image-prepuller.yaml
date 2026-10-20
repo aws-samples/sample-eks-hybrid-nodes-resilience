@@ -1,0 +1,49 @@
+# =============================================================================
+# IMAGE PRE-PULLER - Module 3.2 Practice 1
+#
+# Forces every critical image onto every hybrid node AHEAD of a disconnection.
+# The pattern: one init container per critical image running /bin/true and
+# exiting - the pull is the point, not the process. The pause main container
+# keeps the DaemonSet "Running" at near-zero cost, and a new node joining the
+# cluster is pre-warmed automatically (same DaemonSet mechanic as the CNI).
+#
+# ${INFERENCE_REGISTRY} resolved at provisioning: your account's ECR (images built there by CodeBuild).
+# =============================================================================
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-prepuller
+  namespace: kube-system
+  labels: {app: image-prepuller}
+spec:
+  selector:
+    matchLabels: {app: image-prepuller}
+  template:
+    metadata:
+      labels: {app: image-prepuller}
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: hybrid   # only hybrid nodes need the insurance
+      tolerations:
+        - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute}
+        - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute}
+      initContainers:
+        # one init container per critical image - add yours to the list
+        - name: pull-inference-model
+          image: ${INFERENCE_REGISTRY}/ollama-llama32-1b:latest   # the multi-GB one that matters most
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/true"]
+        - name: pull-metrics-proxy
+          image: public.ecr.aws/docker/library/python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/true"]
+        - name: pull-client
+          image: public.ecr.aws/docker/library/busybox:1.37
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/true"]
+      containers:
+        - name: pause
+          image: public.ecr.aws/eks-distro/kubernetes/pause:3.9
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}

@@ -1,0 +1,409 @@
+# =============================================================================
+# INFERENCE SERVICE (on-premises baseline) - Module 3.1
+#
+# What this file deploys (referenced by content pages 3.1, 3.3, 4.1, 5.3, 6.x):
+#   - Deployment `inference`      : Ollama llama3.2:1b, pinned to hybrid nodes,
+#                                   one pod per node, disconnect-tolerant
+#   - metrics-proxy sidecar       : exposes ollama_* Prometheus metrics
+#                                   (Ollama has none natively) - see ConfigMap
+#   - Service `inference`         : ClusterIP, the on-prem pod mesh path
+#   - Service `inference-local`   : internalTrafficPolicy=Local (same-node path)
+#   - client-local / client-cross-node / client-cloud-to-hybrid:
+#     the three observation posts of Module 5.1
+#   - traffic-generator           : demand source for Modules 3.3, 5.2, 6.4
+#     (runs ON hybrid nodes so the request-rate panel keeps flowing during
+#      a disconnection - that contrast is the whole point of page 4.2)
+#
+# ${INFERENCE_REGISTRY} resolved at provisioning: your account's ECR (images built there by CodeBuild).
+# =============================================================================
+---
+# Metrics proxy: stdlib-only asyncio TCP splice in front of Ollama.
+# Zero pip installs (a pod restarting DURING a disconnection must come back).
+# Per-connection accounting (clients open one connection per request):
+#   ollama_http_requests_total, ollama_request_duration_seconds (histogram),
+#   ollama_requests_running, ollama_requests_waiting (in-flight vs PARALLEL).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ollama-metrics-proxy
+  namespace: default
+data:
+  proxy.py: |
+    import asyncio, os, time
+    PARALLEL = int(os.environ.get("PARALLEL", "2"))
+    UP = ("127.0.0.1", 11434)
+    LISTEN = int(os.environ.get("LISTEN_PORT", "8080"))
+    BUCKETS = [0.5, 1, 2, 5, 10, 20, 30, 60]
+    state = {"inflight": 0, "total": 0, "sum": 0.0, "hist": [0] * len(BUCKETS)}
+
+    def metrics():
+        running = min(state["inflight"], PARALLEL)
+        waiting = max(0, state["inflight"] - PARALLEL)
+        out = [
+            "# TYPE ollama_requests_running gauge",
+            f"ollama_requests_running {running}",
+            "# TYPE ollama_requests_waiting gauge",
+            f"ollama_requests_waiting {waiting}",
+            "# TYPE ollama_http_requests_total counter",
+            f"ollama_http_requests_total {state['total']}",
+            "# TYPE ollama_request_duration_seconds histogram",
+        ]
+        for i, b in enumerate(BUCKETS):
+            out.append(f'ollama_request_duration_seconds_bucket{{le="{b}"}} {state["hist"][i]}')
+        out.append(f'ollama_request_duration_seconds_bucket{{le="+Inf"}} {state["total"]}')
+        out.append(f"ollama_request_duration_seconds_sum {state['sum']}")
+        out.append(f"ollama_request_duration_seconds_count {state['total']}")
+        return ("\n".join(out) + "\n").encode()
+
+    async def pump(r, w):
+        try:
+            while True:
+                data = await r.read(65536)
+                if not data:
+                    break
+                w.write(data)
+                await w.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                w.close()
+            except Exception:
+                pass
+
+    async def handle(cr, cw):
+        try:
+            first = await cr.read(65536)
+        except Exception:
+            cw.close(); return
+        if not first:
+            cw.close(); return
+        if first.startswith(b"GET /metrics"):
+            body = metrics()
+            cw.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n"
+                     b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+            try:
+                await cw.drain()
+            except Exception:
+                pass
+            cw.close(); return
+        state["inflight"] += 1
+        state["total"] += 1
+        t0 = time.monotonic()
+        try:
+            ur, uw = await asyncio.open_connection(*UP)
+            uw.write(first)
+            await uw.drain()
+            await asyncio.gather(pump(cr, uw), pump(ur, cw))
+        except Exception:
+            try:
+                cw.close()
+            except Exception:
+                pass
+        finally:
+            d = time.monotonic() - t0
+            state["sum"] += d
+            for i, b in enumerate(BUCKETS):
+                if d <= b:
+                    state["hist"][i] += 1
+            state["inflight"] -= 1
+
+    async def main():
+        server = await asyncio.start_server(handle, "0.0.0.0", LISTEN)
+        async with server:
+            await server.serve_forever()
+
+    asyncio.run(main())
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference
+  namespace: default
+  labels: {app: inference, tier: onprem-baseline}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: inference}
+  template:
+    metadata:
+      labels: {app: inference}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: hybrid    # runs ONLY on-premises (Module 6 relaxes this)
+      # one pod per hybrid node - the cross-node path of Module 4 depends on it
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: inference}
+      tolerations:
+        - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute}   # survive NotReady without eviction
+        - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute}
+      containers:
+        - name: ollama
+          image: ${INFERENCE_REGISTRY}/ollama-llama32-1b:latest   # model baked into the image
+          imagePullPolicy: IfNotPresent                      # a cached image must never trigger a registry call
+          env:
+            - {name: OLLAMA_NUM_PARALLEL, value: "2"}
+            - {name: OLLAMA_KEEP_ALIVE, value: "-1"}         # keep the model loaded (no cold start per request)
+          ports:
+            - {containerPort: 11434, name: ollama}
+          resources:
+            requests: {cpu: "1500m", memory: 3Gi}
+          readinessProbe:
+            httpGet: {path: /, port: 11434}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+        - name: metrics-proxy
+          image: public.ecr.aws/docker/library/python:3.12-alpine
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          command: ["python3", "/app/proxy.py"]
+          env:
+            - {name: PARALLEL, value: "2"}
+            - {name: LISTEN_PORT, value: "8080"}
+          ports:
+            - {containerPort: 8080, name: http}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+          volumeMounts:
+            - {name: proxy-code, mountPath: /app}
+      volumes:
+        - name: proxy-code
+          configMap: {name: ollama-metrics-proxy}
+---
+# The on-prem pod mesh path: ClusterIP over the Cilium overlay. No AWS dependency.
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference
+  namespace: default
+  labels: {app: inference}
+spec:
+  selector: {app: inference}
+  ports:
+    - {name: http, port: 80, targetPort: 8080}
+---
+# The same-node path: internalTrafficPolicy=Local means a client's request is
+# only ever served by an inference pod on the client's OWN node. The same
+# mechanism Module 4.3 applies to CoreDNS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-local
+  namespace: default
+  labels: {app: inference}
+spec:
+  selector: {app: inference}
+  internalTrafficPolicy: Local
+  ports:
+    - {name: http, port: 80, targetPort: 8080}
+---
+# ═══ Module 4.1 observation posts: the three communication paths ═══
+#
+#   client-local           (hybrid) -> inference-local  = SAME-NODE path
+#   client-cross-node      (hybrid) -> inference        = ON-PREM MESH path
+#   client-cloud-to-hybrid (cloud)  -> inference        = CROSS-CLUSTER path (VPN)
+#
+# During a disconnection the first two keep printing 200; the third times out.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client-local
+  namespace: default
+  labels: {app: client, path: local}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: client, path: local}
+  template:
+    metadata:
+      labels: {app: client, path: local}
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: hybrid
+      tolerations:
+        - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute}
+        - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute}
+      containers:
+        - name: client
+          # busybox: wget is BUILT IN. The previous alpine+`apk add curl` version
+          # needed internet at pod start, which is exactly what a hybrid node
+          # cannot count on (it printed "curl unavailable" and slept forever).
+          image: public.ecr.aws/docker/library/busybox:1.37
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              SEQ=0
+              while true; do
+                SEQ=$((SEQ+1)); TS=$(date '+%H:%M:%S')
+                if wget -q -T 5 -O /dev/null http://inference-local.default.svc.cluster.local/ 2>/dev/null; then M="HTTP 200 OK"; else M="UNREACHABLE FAIL"; fi
+                echo "[${TS}] #${SEQ} LOCAL (same node) -> inference | ${M}"
+                sleep 1
+              done
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client-cross-node
+  namespace: default
+  labels: {app: client, path: cross-node}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: client, path: cross-node}
+  template:
+    metadata:
+      labels: {app: client, path: cross-node}
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: hybrid
+      tolerations:
+        - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute}
+        - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute}
+      containers:
+        - name: client
+          # busybox: wget is BUILT IN. The previous alpine+`apk add curl` version
+          # needed internet at pod start, which is exactly what a hybrid node
+          # cannot count on (it printed "curl unavailable" and slept forever).
+          image: public.ecr.aws/docker/library/busybox:1.37
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              SEQ=0
+              while true; do
+                SEQ=$((SEQ+1)); TS=$(date '+%H:%M:%S')
+                if wget -q -T 5 -O /dev/null http://inference.default.svc.cluster.local/ 2>/dev/null; then M="HTTP 200 OK"; else M="UNREACHABLE FAIL"; fi
+                echo "[${TS}] #${SEQ} ON-PREM MESH (ClusterIP over Cilium) -> inference | ${M}"
+                sleep 1
+              done
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+---
+# Headless service: DNS returns the POD IPs directly instead of a ClusterIP.
+# This exists because of a measured limitation, not for style. A regular
+# ClusterIP whose endpoints are ALL on hybrid nodes is NOT reachable from a pod
+# on a cloud node: the cloud node's kube-proxy rewrites the destination to the
+# pod IP, and that rewritten packet never reaches the data center - measured on
+# event d7ac04e1, where the same client reached the pod IP directly in 3 ms and
+# the ClusterIP not at all, for minutes. Pod-to-pod through the Hybrid Nodes
+# gateway works (the gateway source-NATs it to its own address, visible in a
+# capture on the node); the DNAT'd flow does not survive the trip.
+# A headless service sidesteps it: the client resolves the name to pod IPs and
+# connects to one of them, which is the path that works - and it still crosses
+# the WAN, so it still fails when module 5.1 cuts the link, which is the whole
+# job of this observation post.
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-headless
+  namespace: default
+  labels: {app: inference}
+spec:
+  clusterIP: None
+  selector: {app: inference}
+  ports:
+    - {name: http, port: 8080, targetPort: 8080}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client-cloud-to-hybrid
+  namespace: default
+  labels: {app: client, path: cloud-to-hybrid}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: client, path: cloud-to-hybrid}
+  template:
+    metadata:
+      labels: {app: client, path: cloud-to-hybrid}
+    spec:
+      # cloud node only: this client's packets cross TGW + VPN to reach the pods
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: eks.amazonaws.com/compute-type, operator: NotIn, values: [hybrid]}
+      containers:
+        - name: client
+          # busybox: wget is BUILT IN. The previous alpine+`apk add curl` version
+          # needed internet at pod start, which is exactly what a hybrid node
+          # cannot count on (it printed "curl unavailable" and slept forever).
+          image: public.ecr.aws/docker/library/busybox:1.37
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              SEQ=0
+              while true; do
+                SEQ=$((SEQ+1)); TS=$(date '+%H:%M:%S')
+                if wget -q -T 5 -O /dev/null http://inference-headless.default.svc.cluster.local:8080/ 2>/dev/null; then M="HTTP 200 OK"; else M="UNREACHABLE FAIL"; fi
+                echo "[${TS}] #${SEQ} CROSS-CLUSTER (cloud -> VPN -> on-prem) -> inference | ${M}"
+                sleep 1
+              done
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+---
+# Demand source (Modules 3.3, 5.2, 6.2, 6.4). Runs ON the hybrid nodes: local
+# users keep generating load during a disconnection, which is exactly what the
+# "request rate keeps flowing" panel of page 4.2 demonstrates.
+# Scale it to raise pressure: kubectl scale deployment traffic-generator --replicas=N
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-generator
+  namespace: default
+  labels: {app: traffic-generator}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: traffic-generator}
+  template:
+    metadata:
+      labels: {app: traffic-generator}
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/compute-type: hybrid
+      tolerations:
+        - {key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute}
+        - {key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute}
+      containers:
+        - name: generator
+          image: public.ecr.aws/docker/library/busybox:1.37
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              while true; do
+                START=$(date +%s)
+                if wget -q -T 60 -O /dev/null --post-data '{"model":"llama3.2:1b","prompt":"Reply with one short sentence about Kubernetes.","stream":false}' \
+                     --header 'Content-Type: application/json' http://inference-lb.default.svc.cluster.local/api/generate 2>/dev/null; then
+                  echo "[$(date '+%H:%M:%S')] generate | OK | $(( $(date +%s) - START ))s"
+                else
+                  echo "[$(date '+%H:%M:%S')] generate | FAIL"
+                fi
+                sleep 2
+              done
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}

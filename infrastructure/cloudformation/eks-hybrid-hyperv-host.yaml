@@ -1,0 +1,949 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EKS Hybrid Nodes Workshop - the on-premises "physical server": an EC2
+  m8i.4xlarge with NESTED VIRTUALIZATION running Windows Server + Hyper-V, whose
+  guest VMs are the hybrid nodes. Also owns the DC routes for the VM networks and
+  triggers the SSM Automation that builds everything inside the host.
+  Blueprint: docs/nested-virt-validation.md
+
+Parameters:
+  WorkshopName:
+    Type: String
+    Default: eks-hybrid
+  ClusterName:
+    Type: String
+    Default: eks-hybrid-workshop
+    Description: Cluster the pre-joined node registers with (self-join at first boot)
+  DcVpcId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/dc-vpc-id
+  SubnetId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/dc-private-subnet
+  DcPrivateRtId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/dc-private-route-table
+  DcPublicRtId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/dc-public-route-table
+  RemoteNodeCidr:
+    Type: String
+    Default: 10.80.0.0/16
+  RemotePodCidr:
+    Type: String
+    Default: 10.85.0.0/16
+  AssetsBucket:
+    Type: String
+  ArtifactBucket:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/eks-hybrid/ide-artifact-bucket
+    Description: Account-local bucket where the IDE publishes ubuntu-24.04-base.vhdx
+  AssetsBucketPrefix:
+    Type: String
+    Default: ''
+    Description: Workshop Studio {{.AssetsBucketPrefix}} magic variable
+  WindowsAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base
+
+Conditions:
+  HasAssetsBucketPrefix: !Not [!Equals [!Ref AssetsBucketPrefix, '']]
+
+Resources:
+  HostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: read-seed-assets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Workshop Studio publishes the repo's assets/ tree under
+              # <event-id>/assets/, so the seeds are at
+              # <prefix>workshop/seeds/ - NOT at the bucket root. Scoping this to
+              # /seeds/* (as it was until 2026-08-08) made Read-S3Object fail with
+              # Access Denied, which at least failed loudly, unlike the earlier
+              # wrong-key version that silently wrote a 0-byte seed.
+              - Effect: Allow
+                Action: ['s3:GetObject']
+                Resource: !Sub 'arn:aws:s3:::${AssetsBucket}/${AssetsBucketPrefix}workshop/seeds/*'
+              - Effect: Allow
+                Action: ['s3:GetObject']
+                Resource: !Sub 'arn:aws:s3:::${ArtifactBucket}/hyperv/ubuntu-24.04-base.vhdx'
+              # RDP password (SetRdpPassword automation step reads it on-host)
+              - Effect: Allow
+                # PutSecretValue: the automation rewrites the credential JSON with
+                # username BEFORE password, because GenerateSecretString puts the
+                # generated key first and the console then shows the password above
+                # the user - an invitation to paste the wrong one on autopilot.
+                Action: ['secretsmanager:GetSecretValue', 'secretsmanager:PutSecretValue']
+                Resource: !Ref RdpPasswordSecret
+              # the secret's customer managed key: read it (Decrypt) and write the
+              # reordered JSON back (GenerateDataKey)
+              - Effect: Allow
+                Action: ['kms:Decrypt', 'kms:GenerateDataKey']
+                Resource: !GetAtt RdpSecretKey.Arn
+  HostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref HostRole]}
+
+  HostSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Hyper-V host - allows DC/VPN traffic to reach the nested VMs
+      VpcId: !Ref DcVpcId
+      SecurityGroupIngress:
+        # inbound from the EKS VPC (control plane relay, cloud pods) and DC CIDRs
+        - {IpProtocol: '-1', CidrIp: 10.42.0.0/16}
+        - {IpProtocol: '-1', CidrIp: !Ref RemoteNodeCidr}
+        - {IpProtocol: '-1', CidrIp: !Ref RemotePodCidr}
+        - {IpProtocol: '-1', CidrIp: 10.90.0.0/16}
+      # Stated explicitly rather than left to the implicit default. The host, and
+      # the nested VMs it routes for, reach the VPN appliance, Systems Manager, S3
+      # and the EKS endpoint, and the VMs download nodeadm and the Kubernetes
+      # artifacts from the internet, so egress is open by design.
+      SecurityGroupEgress:
+        - {IpProtocol: '-1', CidrIp: 0.0.0.0/0, Description: 'Host and nested VMs: SSM, S3, EKS endpoint, VPN appliance, package downloads'}
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-hyperv-sg'}]
+
+  # source/dest check OFF: the host forwards traffic for the nested networks
+  HostEni:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref SubnetId
+      GroupSet: [!Ref HostSg]
+      SourceDestCheck: false
+      Tags: [{Key: Name, Value: !Sub '${WorkshopName}-hyperv-eni'}]
+
+  # CRITICAL: AWS::EC2::Instance does NOT support CpuOptions.NestedVirtualization
+  # in CloudFormation (verified via describe-type 2026-07-31) - only LaunchTemplate does.
+  HostLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${WorkshopName}-hyperv-lt'
+      LaunchTemplateData:
+        ImageId: !Ref WindowsAmi
+        InstanceType: m8i.4xlarge
+        # IMDSv2 only. The automation reads the region from IMDS with a token
+        # already, and the nested VMs are blocked from IMDS entirely by their
+        # cloud-init (a simulated data center has no metadata service).
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          # One hop. The nested VMs sit one routed hop behind this host, so a hop
+          # limit of 2 would let a token response reach them and hand them the
+          # host role (which can read and rewrite the RDP secret). With 1 the
+          # platform drops it, and the VMs' own iptables block stays as defense
+          # in depth. The host's AWS Tools and SSM agent call IMDS directly.
+          HttpPutResponseHopLimit: 1
+        CpuOptions:
+          # The whole workshop depends on this line.
+          NestedVirtualization: enabled
+        IamInstanceProfile: {Name: !Ref HostProfile}
+        BlockDeviceMappings:
+          # Encrypted explicitly (the account's default EBS key): both VM disks,
+          # with their node credentials, live on this volume.
+          - DeviceName: /dev/sda1
+            Ebs: {VolumeSize: 300, VolumeType: gp3, Throughput: 250, Encrypted: true, DeleteOnTermination: true}
+
+  Host:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref HostLaunchTemplate
+        # PINNED to version 1 on purpose. With LatestVersionNumber, ANY edit to
+        # the launch template makes CloudFormation replace this instance - and
+        # replacing it destroys the nested VMs (the participant's joined hybrid
+        # node included). It also cannot even succeed: the instance holds a
+        # pre-created ENI, so the replacement fails with
+        # "Interface: [eni-...] in use" and the whole stack rolls back
+        # (hit for real 2026-08-08 while adding the block/unblock documents).
+        # Every event deploys a FRESH stack, where version 1 is the current
+        # template content, so pinning costs nothing here. If the launch template
+        # ever needs to change for a RUNNING environment, bump this deliberately
+        # and accept that the VMs are rebuilt by the (idempotent) automation.
+        Version: '1'
+      NetworkInterfaces:
+        - {NetworkInterfaceId: !Ref HostEni, DeviceIndex: '0'}
+      Tags:
+        - {Key: Name, Value: 'On-Premises DataCenter - Hyper-V Host (your physical server)'}
+        - {Key: workshop-role, Value: hyperv-host}
+
+  # RDP access for participants (Fleet Manager Remote Desktop or classic RDP).
+  # Stored as a CREDENTIAL PAIR (username + password) so the Secrets Manager
+  # console shows both fields with copy buttons - the username matters, since
+  # 'Administrator' is not obvious to anyone without Windows Server background.
+  # Customer managed key for the RDP secret. The key policy only delegates to IAM
+  # in this account; HostRole gets Decrypt/GenerateDataKey below, and the IDE role
+  # (code-editor stack) gets Decrypt through Secrets Manager for this secret only.
+  # Deleted with the stack after a 7-day waiting period.
+  RdpSecretKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub 'Encrypts /${WorkshopName}/hyperv-rdp-credentials'
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministrationThroughIam
+            Effect: Allow
+            Principal: {AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'}
+            Action: 'kms:*'
+            Resource: '*'
+      Tags: [{Key: workshop, Value: !Ref WorkshopName}]
+
+  RdpPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '/${WorkshopName}/hyperv-rdp-credentials'
+      Description: 'RDP credentials for the Hyper-V host (user Administrator) - Fleet Manager or RDP client'
+      KmsKeyId: !Ref RdpSecretKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"Administrator"}'
+        GenerateStringKey: password
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\`$'''
+
+  # VM/pod networks route to the host ENI
+  RouteRemoteNodes:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref DcPrivateRtId
+      DestinationCidrBlock: !Ref RemoteNodeCidr
+      NetworkInterfaceId: !Ref HostEni
+  RouteRemotePods:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref DcPrivateRtId
+      DestinationCidrBlock: !Ref RemotePodCidr
+      NetworkInterfaceId: !Ref HostEni
+
+  # SAME routes in the PUBLIC subnet table: that is where the VPN appliance
+  # lives, and after it decapsulates a tunnel packet the VPC router needs to
+  # know that the VM/pod CIDRs live behind this host's ENI. Missing these two
+  # routes = tunnels UP, TGW routes active, and cloud->on-prem still blackholes
+  # (diagnosed in the v5 e2e 2026-08-06).
+  RouteRemoteNodesPublic:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref DcPublicRtId
+      DestinationCidrBlock: !Ref RemoteNodeCidr
+      NetworkInterfaceId: !Ref HostEni
+  RouteRemotePodsPublic:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref DcPublicRtId
+      DestinationCidrBlock: !Ref RemotePodCidr
+      NetworkInterfaceId: !Ref HostEni
+
+  # -------- Automation execution role + trigger
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ssm.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals: {'aws:SourceAccount': !Ref 'AWS::AccountId'}
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-execution/*'
+      Policies:
+        - PolicyName: hyperv-automation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # read-only / list APIs have no resource-level support
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                  - ssm:ListCommands
+                  - ssm:ListCommandInvocations
+                  - ec2:DescribeInstances
+                Resource: '*'
+              # the signal step reads the WaitConditionHandle URL from here
+              - Effect: Allow
+                Action: ['ssm:GetParameter']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/workshop/${WorkshopName}/hyperv-signal-url'
+              # writes scoped to this region/account: the AWS-owned documents the
+              # automation invokes, and the instances it drives
+              - Effect: Allow
+                Action: ['ssm:SendCommand']
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunPowerShellScript'
+                  # SpreadCoreDns runs kubectl, which only exists on the IDE box
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+              - Effect: Allow
+                Action: ['ec2:RebootInstances']
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+              # Pre-joined node (hybrid-node-1): the automation creates the SSM
+              # hybrid activation bound to the Hybrid Nodes role at provisioning
+              - Effect: Allow
+                Action: ['ssm:CreateActivation', 'ssm:AddTagsToResource']
+                Resource: '*'
+              - Effect: Allow
+                Action: ['iam:PassRole']
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/eks-hybrid-nodes-role'
+                Condition: {StringEquals: {'iam:PassedToService': 'ssm.amazonaws.com'}}
+
+  HypervSetupDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: !Sub '${WorkshopName}-hyperv-setup'
+      UpdateMethod: NewVersion
+      # Inlined from provisioning/ssm/hyperv-setup-automation.yaml (that file
+      # stays the readable source of truth; keep both in sync).
+      Content:
+        schemaVersion: '0.3'
+        description: 'EKS Hybrid Nodes Workshop - Hyper-V host setup: role install, reboot, DC network (switch + NAT), Ubuntu image preparation, 2 nested VMs with cloud-init, health check. hybrid-node-1 self-joins the EKS cluster at first boot (didactic design: pre-joined reference node); hybrid-node-2 stays plain for the participant to join in Module 2.'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          InstanceId:
+            type: String
+            description: Hyper-V host instance ID (m8i.4xlarge, NestedVirtualization=enabled)
+          AutomationAssumeRole:
+            type: String
+          AssetsBucket:
+            type: String
+            description: S3 bucket with the seed artifacts (user-data templates, scripts)
+          ArtifactBucket:
+            type: String
+            description: Account-local S3 bucket containing hyperv/ubuntu-24.04-base.vhdx
+          AssetsBucketPrefix:
+            type: String
+            default: ''
+            description: 'Key prefix inside the assets bucket. Workshop Studio publishes the repo''s assets/ tree under <event-id>/assets/, so the seeds live at <prefix>workshop/seeds/. Reading them from the bucket ROOT (which is what this document did until 2026-08-08) silently produced a 0-byte user-data file: both VMs then booted with NO cloud-init config, so no static IP, no network, and the only symptom was HealthCheck failing on ICMP 20 minutes later. The seeds used to live in provisioning/assets/, which Workshop Studio never publishes at all.'
+          ClusterName:
+            type: String
+            default: eks-hybrid-workshop
+            description: EKS cluster name injected into hybrid-node-1's nodeConfig (self-join)
+          NodeRoleName:
+            type: String
+            default: eks-hybrid-nodes-role
+            description: Hybrid Nodes IAM role bound to the provisioning activation
+          SignalUrlParam:
+            type: String
+            default: ''
+            description: >
+              NAME of the SSM parameter holding the CloudFormation
+              WaitConditionHandle URL. The URL itself is NOT passed as an
+              automation parameter, and that is not a style choice: a State Manager
+              association caps each parameter value at 512 characters, and a
+              presigned handle URL is around 1400. Passing it directly makes
+              AWS::SSM::Association fail to create with "must have length less than
+              or equal to 512" - measured on event 483f43d8, which failed
+              provisioning at 35 min. Passing the short NAME keeps both entry points
+              (the kick-off custom resource and the fallback association) able to
+              signal. Empty means "do not signal", so the document stays runnable by
+              hand.
+        mainSteps:
+        - name: InstallHyperV
+          action: aws:runCommand
+          inputs:
+            DocumentName: AWS-RunPowerShellScript
+            InstanceIds:
+            - '{{ InstanceId }}'
+            Parameters:
+              commands:
+              - Install-WindowsFeature -Name Hyper-V -IncludeManagementTools
+          timeoutSeconds: 600
+        - name: CheckHypervisor
+          action: aws:runCommand
+          maxAttempts: 3
+          inputs:
+            DocumentName: AWS-RunPowerShellScript
+            InstanceIds:
+            - '{{ InstanceId }}'
+            Parameters:
+              commands:
+              - '$s = (Get-Service vmms -ErrorAction SilentlyContinue)
+
+                if ($s -and $s.Status -eq ''Running'') { Write-Output ''HYPERVISOR_LIVE'' }
+
+                else { Write-Output ''HYPERVISOR_NEEDS_REBOOT'' }
+
+                '
+          timeoutSeconds: 300
+          nextStep: BranchHypervisor
+        - name: BranchHypervisor
+          action: aws:branch
+          inputs:
+            Choices:
+            - NextStep: SetRdpPassword
+              Variable: '{{ CheckHypervisor.Output }}'
+              Contains: HYPERVISOR_LIVE
+            Default: Reboot
+        - name: Reboot
+          action: aws:executeAwsApi
+          inputs:
+            Service: ec2
+            Api: RebootInstances
+            InstanceIds:
+            - '{{ InstanceId }}'
+        - name: WaitSsmOnline
+          action: aws:waitForAwsResourceProperty
+          timeoutSeconds: 900
+          inputs:
+            Service: ssm
+            Api: DescribeInstanceInformation
+            Filters:
+            - Key: InstanceIds
+              Values:
+              - '{{ InstanceId }}'
+            PropertySelector: $.InstanceInformationList[0].PingStatus
+            DesiredValues:
+            - Online
+        - name: VerifyHyperV
+          action: aws:runCommand
+          inputs:
+            DocumentName: AWS-RunPowerShellScript
+            InstanceIds:
+            - '{{ InstanceId }}'
+            Parameters:
+              commands:
+              - "$deadline = (Get-Date).AddMinutes(5)\ndo {\n  $vmms = Get-Service vmms -ErrorAction SilentlyContinue\n  if ($vmms -and $vmms.Status -eq 'Running') { break }\n  Start-Sleep -Seconds 15\n} while ((Get-Date) -lt $deadline)\nif (-not $vmms -or $vmms.Status -ne 'Running') {\n  throw \"vmms not running after 5 minutes (Hyper-V role installed but hypervisor did not come up)\"\n}\nGet-VMHost | Out-Null\nWrite-Output \"HYPERV_OK\"\n"
+          timeoutSeconds: 600
+          maxAttempts: 3
+          nextStep: SetRdpPassword
+        - name: SetRdpPassword
+          action: aws:runCommand
+          inputs:
+            DocumentName: AWS-RunPowerShellScript
+            InstanceIds:
+            - '{{ InstanceId }}'
+            Parameters:
+              commands:
+              - '$region = (Invoke-RestMethod -Headers @{''X-aws-ec2-metadata-token'' = (Invoke-RestMethod -Method Put -Uri http://169.254.169.254/latest/api/token -Headers @{''X-aws-ec2-metadata-token-ttl-seconds''=''300''})} -Uri http://169.254.169.254/latest/meta-data/placement/region)
+
+                # credential pair: {"username":"Administrator","password":"..."}
+
+                $cred = (Get-SECSecretValue -SecretId ''/eks-hybrid/hyperv-rdp-credentials'' -Region $region).SecretString | ConvertFrom-Json
+
+                if (-not $cred.password) { throw "RDP credential secret empty or malformed" }
+
+                net user $cred.username "$($cred.password)"
+
+                if ($LASTEXITCODE -ne 0) { throw "failed setting Administrator password" }
+
+                # Rewrite the secret with username FIRST. GenerateSecretString puts the
+
+                # generated key ahead of the template, so the console showed password
+
+                # above username - and a participant copying on autopilot pastes the
+
+                # password into the user field. The console renders the JSON in
+
+                # document order, so the order here is the order they see.
+
+                $ordered = "{`"username`":`"$($cred.username)`",`"password`":`"$($cred.password)`"}"
+
+                Write-SECSecretValue -SecretId ''/eks-hybrid/hyperv-rdp-credentials'' -SecretString $ordered -Region $region | Out-Null
+
+                Write-Output "RDP_PASSWORD_SET"
+
+                '
+              - "# Make the hypervisor the FIRST thing a participant sees if they log in.\n# Without this they land on a bare Windows desktop and have to know that\n# Hyper-V Manager exists and where to find it - the VMs are the whole\n# reason to open this box at all.\n$mmc = \"$env:SystemRoot\\System32\\virtmgmt.msc\"\n$pub = \"$env:PUBLIC\\Desktop\\Hyper-V Manager.lnk\"\n$ws = New-Object -ComObject WScript.Shell\n$sc = $ws.CreateShortcut($pub)\n$sc.TargetPath = \"$env:SystemRoot\\System32\\mmc.exe\"\n$sc.Arguments = $mmc\n$sc.IconLocation = \"$env:SystemRoot\\System32\\vmms.exe,0\"\n$sc.Description = \"Hyper-V Manager - your two hybrid node VMs\"\n$sc.Save()\n# and auto-open it at logon for every user (Run key, not Startup folder:\n# survives profile creation for a user that has never logged in yet)\nNew-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run' `\n  -Name 'HyperVManager' -PropertyType String `\n  -Value \"$env:SystemRoot\\System32\\mmc.exe `\"$mmc`\"\" -Force | Out-Null\nWrite-Output \"HYPERV_SHORTCUT_OK\"\n"
+          timeoutSeconds: 300
+        - name: CreateDcNetwork
+          action: aws:runCommand
+          inputs:
+            DocumentName: AWS-RunPowerShellScript
+            InstanceIds:
+            - '{{ InstanceId }}'
+            Parameters:
+              commands:
+              - "if (-not (Get-VMSwitch -Name DCSwitch -ErrorAction SilentlyContinue)) {\n  New-VMSwitch -Name DCSwitch -SwitchType Internal | Out-Null\n  New-NetIPAddress -IPAddress 10.80.0.1 -PrefixLength 16 -InterfaceAlias \"vEthernet (DCSwitch)\" | Out-Null\n}\n# ROUTING, not NAT (see the comment in the automation source)\nSet-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name IPEnableRouter -Value 1\nSet-Service -Name RemoteAccess -StartupType Automatic\nStart-Service RemoteAccess -ErrorAction SilentlyContinue\nSet-NetIPInterface -InterfaceAlias \"vEthernet (DCSwitch)\" -Forwarding Enabled -ErrorAction SilentlyContinue\nGet-NetAdapter -Physical | ForEach-Object {\n  Set-NetIPInterface -InterfaceIndex $_.ifIndex -Forwarding Enabled -ErrorAction SilentlyContinue\n}\n# a leftover NAT from an older run would silently break inbound\nGet-NetNat -ErrorAction SilentlyContinue | Remove-NetNat -Confirm:$false -ErrorAction SilentlyContinue\n# The POD CIDR lives BEHIND the VMs: Cilium (cluster-pool IPAM) hands\n# each node a slice of 10.85.0.0/16 and nodes forward between slices\n# over their own overlay. So ONE route via a hybrid node is enough -\n# that node delivers locally or forwards to its peer.\n# WITHOUT this route, cloud pod -> hybrid pod times out even with the\n# tunnels up and every VPC/TGW route in place (v5 e2e 2026-08-06).\n$podCidr = \"10.85.0.0\"; $podMask = \"255.255.0.0\"\nroute delete $podCidr 2>$null | Out-Null\nroute -p add $podCidr mask $podMask 10.80.1.11 metric 10 | Out-Null\nroute -p add $podCidr mask $podMask 10.80.1.12 metric 20 | Out-Null\nWrite-Output \"DCNET_OK (routing mode, NAT disabled, pod CIDR routed via hybrid nodes)\"\n"
+          timeoutSeconds: 300
+        - name: PrepareImage
+          action: aws:runCommand
+          inputs:
+            DocumentName: AWS-RunPowerShellScript
+            InstanceIds:
+            - '{{ InstanceId }}'
+            Parameters:
+              commands:
+              - "$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\nmkdir C:\\lab -Force | Out-Null\n$target = 'C:\\lab\\ubuntu-base.vhdx'\n# A base is usable only when its length equals the S3 object's\n# ContentLength (and >= 500MB), its sha256 equals the one the IDE\n# producer published as object metadata, AND Hyper-V can parse it. Size\n# alone is not proof: Event Test 15fea548 (2026-10-13) passed this step\n# on size, then both per-VM copies failed Resize-VHD with 0x80070570\n# (corrupted and unreadable). Test-VHD checks structure, not content, so\n# a file of the right length with damaged payload bytes passes it; the\n# sha256 does not. Only a 'truncated' or 'corrupt' verdict is evidence\n# the BYTES are bad. A sharing or access error ('locked') says nothing\n# about them, so a base in that state is never deleted.\nfunction Test-LockError($err) {\n  # ACCESS_DENIED, SHARING_VIOLATION, LOCK_VIOLATION (0x80070005/20/21)\n  $codes = @(-2147024891, -2147024864, -2147024863)\n  $e = $err.Exception\n  while ($e) {\n    if ($e -is [System.UnauthorizedAccessException] -or $codes -contains $e.HResult) { return $true }\n    $e = $e.InnerException\n  }\n  return [bool](\"$err\" -match '0x80070005|0x80070020|0x80070021|being used by another process|[Aa]ccess is denied')\n}\nfunction Get-BaseImageState([string]$Path, [long]$Expected, [string]$ExpectedSha) {\n  if (-not (Test-Path $Path)) { return @{ Kind = 'missing'; Reason = 'missing' } }\n  $len = (Get-Item $Path).Length\n  if ($len -lt 500MB) { return @{ Kind = 'truncated'; Reason = \"only $len bytes, expected >=500MB\" } }\n  if ($len -ne $Expected) {\n    return @{ Kind = 'truncated'; Reason = \"$len bytes, S3 ContentLength is $Expected (truncated or stale download)\" }\n  }\n  try {\n    $sha = (Get-FileHash -Path $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()\n    if ($sha -ne $ExpectedSha) {\n      return @{ Kind = 'corrupt'; Reason = \"$len bytes but sha256 $sha, the producer published $ExpectedSha\" }\n    }\n    if (Test-VHD -Path $Path) { return @{ Kind = 'ok'; Reason = \"$len bytes, sha256 matches S3, Test-VHD passed\" } }\n    return @{ Kind = 'corrupt'; Reason = \"$len bytes but Test-VHD returned False\" }\n  } catch {\n    if (Test-LockError $_) { return @{ Kind = 'locked'; Reason = \"Test-VHD could not open it: $($_.Exception.Message)\" } }\n    return @{ Kind = 'corrupt'; Reason = \"$len bytes but Test-VHD failed: $($_.Exception.Message)\" }\n  }\n}\n# Same host lock as CreateVMs: an overlapping execution (immediate kick-off\n# and the 30-minute association) must not delete or rewrite the base while\n# CreateVMs is copying it.\n$mutex = [System.Threading.Mutex]::new($false, 'Global\\EksHybridCreateVMs')\n$lockTaken = $false\ntry {\n  try {\n    $lockTaken = $mutex.WaitOne([TimeSpan]::FromMinutes(10))\n  } catch [System.Threading.AbandonedMutexException] {\n    # The previous SSM process died while holding the lock. The OS\n    # transferred ownership to us; continue with the state checks.\n    $lockTaken = $true\n  }\n  if (-not $lockTaken) {\n    throw \"another PrepareImage/CreateVMs execution still holds the host lock after 10 minutes\"\n  }\n  $state = @{ Kind = 'unknown'; Reason = 'S3 object not readable yet' }\n  $lastError = 'none'\n  $deadline = (Get-Date).AddMinutes(15)\n  do {\n    $expected = 0\n    $expectedSha = ''\n    try {\n      $meta = Get-S3ObjectMetadata -BucketName {{ ArtifactBucket }} -Key 'hyperv/ubuntu-24.04-base.vhdx'\n      $expected = [long]$meta.Headers.ContentLength\n      $expectedSha = \"$($meta.Metadata['x-amz-meta-sha256'])\".ToLowerInvariant()\n    } catch {\n      $lastError = \"HeadObject: $($_.Exception.Message)\"\n    }\n    # The producer writes the sha256 metadata only after the qcow2 matched\n    # SHA256SUMS and both images passed qemu-img check. Without it the\n    # object is not published yet: wait, never validate against it.\n    $published = $expected -gt 0 -and $expectedSha.Length -eq 64 -and $expectedSha -match '^[0-9a-f]+$'\n    if (-not $published) {\n      $state = @{ Kind = 'unknown'; Reason = \"S3 object not published yet (ContentLength '$expected', sha256 metadata '$expectedSha')\" }\n    }\n    if ($published) {\n      $state = Get-BaseImageState $target $expected $expectedSha\n      if ($state.Kind -eq 'ok') { break }\n      if ($state.Kind -in 'truncated', 'corrupt') {\n        # Validated bad bytes: remove so the download below starts clean.\n        Write-Output \"base rejected ($($state.Reason)) - removing it and downloading again\"\n        Remove-Item $target -Force -ErrorAction SilentlyContinue\n      }\n      if ($state.Kind -ne 'locked') {\n        try {\n          Read-S3Object -BucketName {{ ArtifactBucket }} -Key 'hyperv/ubuntu-24.04-base.vhdx' -File $target | Out-Null\n        } catch {\n          $lastError = \"download: $($_.Exception.Message)\"\n        }\n        $state = Get-BaseImageState $target $expected $expectedSha\n        if ($state.Kind -eq 'ok') { break }\n        if ($state.Kind -in 'truncated', 'corrupt') {\n          Write-Output \"download rejected ($($state.Reason)) - removing it before the next attempt\"\n          Remove-Item $target -Force -ErrorAction SilentlyContinue\n        }\n      }\n    }\n    Write-Output \"base not usable yet ($($state.Kind): $($state.Reason); last error: $lastError) - retrying in 20s\"\n    Start-Sleep -Seconds 20\n  } while ((Get-Date) -lt $deadline)\n  # Final gate: only a base validated in THIS run (length == S3 length,\n  # >= 500MB, sha256 == S3 metadata, Test-VHD passed) reaches IMAGE_OK.\n  if ($state.Kind -ne 'ok') {\n    throw \"base image not usable after 15 minutes ($($state.Kind): $($state.Reason); last error: $lastError) - check s3://{{ ArtifactBucket }}/hyperv/ubuntu-24.04-base.vhdx and the IDE prepareHypervImage step\"\n  }\n  Write-Output \"IMAGE_OK (ubuntu-base.vhdx $($state.Reason), length and sha256 match account-local S3)\"\n} finally {\n  if ($lockTaken) { $mutex.ReleaseMutex() }\n  $mutex.Dispose()\n}\n"
+          timeoutSeconds: 1800
+        - name: CreateNodeActivation
+          action: aws:executeAwsApi
+          inputs:
+            Service: ssm
+            Api: CreateActivation
+            DefaultInstanceName: eks-hybrid-node-prejoined
+            IamRole: '{{ NodeRoleName }}'
+            RegistrationLimit: 1
+            Tags:
+            - Key: workshop
+              Value: eks-hybrid-nodes
+          outputs:
+          - Name: ActivationId
+            Selector: $.ActivationId
+            Type: String
+          - Name: ActivationCode
+            Selector: $.ActivationCode
+            Type: String
+        - name: CreateVMs
+          action: aws:runCommand
+          inputs:
+            DocumentName: AWS-RunPowerShellScript
+            InstanceIds:
+            - '{{ InstanceId }}'
+            Parameters:
+              commands:
+              - "# Stop on any error. Copy-Item and Resize-VHD failures used to be\n# non-terminating, so a broken disk surfaced only later and far\n# from its cause (Event Test 15fea548, 2026-10-13).\n$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n$region = (Invoke-RestMethod -Headers @{'X-aws-ec2-metadata-token' = (Invoke-RestMethod -Method Put -Uri http://169.254.169.254/latest/api/token -Headers @{'X-aws-ec2-metadata-token-ttl-seconds'='300'})} -Uri http://169.254.169.254/latest/meta-data/placement/region)\n# IDE public key (key-based SSH only - the seeds have no password).\n# AWS Tools for PowerShell, NOT the AWS CLI: the Windows Server AMI\n# ships the PowerShell modules but no `aws` binary (v5 e2e 2026-08-06).\n# Published by the IDE's workshopBootstrap; retried because the IDE\n# stack may still be settling when this host is ready.\n$pubkey = $null\n$deadline = (Get-Date).AddMinutes(10)\ndo {\n  try { $pubkey = (Get-SSMParameter -Name \"/workshop/eks-hybrid/ide-ssh-pubkey\" -Region $region).Value } catch { }\n  if ($pubkey) { break }\n  Start-Sleep -Seconds 20\n} while ((Get-Date) -lt $deadline)\nif (-not $pubkey) { throw \"SSM param ide-ssh-pubkey not published after 10 min - check the IDE bootstrap association\" }\n$mutex = [System.Threading.Mutex]::new($false, 'Global\\EksHybridCreateVMs')\n$lockTaken = $false\ntry {\n  try {\n    $lockTaken = $mutex.WaitOne([TimeSpan]::FromMinutes(10))\n  } catch [System.Threading.AbandonedMutexException] {\n    # The previous SSM process died while holding the lock. The OS\n    # transferred ownership to us; continue with the state checks.\n    $lockTaken = $true\n  }\n  if (-not $lockTaken) {\n    throw \"another CreateVMs execution still holds the host lock after 10 minutes\"\n  }\n$baseMatchesS3 = $false\nforeach ($n in 1,2) {\n  $vm = \"hybrid-node-$n\"\n  $ip = \"10.80.1.$(10 + $n)\"\n  # PRECONDITION: without the base image every disk operation below\n  # fails non-terminatingly and the VM is never created.\n  if (-not (Test-Path C:\\lab\\ubuntu-base.vhdx)) {\n    throw \"C:\\lab\\ubuntu-base.vhdx is missing - PrepareImage did not produce the base image.\"\n  }\n  $existing = @(Get-VM -Name $vm -ErrorAction SilentlyContinue)\n  if ($existing.Count -gt 1) {\n    $states = ($existing | ForEach-Object { \"$($_.Id):$($_.State)\" }) -join ', '\n    Write-Output \"$vm has duplicate registrations ($states) - removing all and rebuilding once\"\n    $existing | Stop-VM -TurnOff -Force -ErrorAction SilentlyContinue\n    $existing | Remove-VM -Force\n    Remove-Item \"C:\\lab\\$vm.vhdx\",\"C:\\lab\\seed-$n.vhdx\" -Force -ErrorAction SilentlyContinue\n    $existing = @()\n  }\n  if ($existing.Count -eq 1) {\n    $current = $existing[0]\n    $icmp = Test-Connection $ip -Count 2 -Quiet -ErrorAction SilentlyContinue\n    $ssh = Test-NetConnection $ip -Port 22 -InformationLevel Quiet -WarningAction SilentlyContinue\n    if ($current.State -eq 'Running' -and $icmp -and $ssh) {\n      Write-Output \"$vm already healthy at $ip - preserving it\"\n      continue\n    }\n    # A VM object existing is not idempotency if the guest never got\n    # network/cloud-init. The old guard skipped it forever, so every\n    # 30-minute self-heal repeated the same HealthCheck failure.\n    Write-Output \"$vm exists but is unhealthy at $ip - rebuilding\"\n    Stop-VM -VM $current -TurnOff -Force -ErrorAction SilentlyContinue\n    Remove-VM -VM $current -Force\n    Remove-Item \"C:\\lab\\$vm.vhdx\",\"C:\\lab\\seed-$n.vhdx\" -Force -ErrorAction SilentlyContinue\n  }\n  # Retry safety under ErrorActionPreference=Stop: a previous run that\n  # died between Copy-Item and New-VM leaves an orphaned per-VM disk\n  # or a (possibly still mounted) seed, and New-VHD on an existing\n  # path now throws instead of limping on. No VM owns these files.\n  try { Dismount-VHD -Path \"C:\\lab\\seed-$n.vhdx\" -ErrorAction SilentlyContinue } catch { }\n  Remove-Item \"C:\\lab\\$vm.vhdx\",\"C:\\lab\\seed-$n.vhdx\" -Force -ErrorAction SilentlyContinue\n  # The base must be the exact object the IDE published (length and\n  # sha256), not only parseable. If a PrepareImage run is killed in the\n  # middle of a download, its lock is abandoned, this step inherits it,\n  # and Test-VHD alone accepts a truncated file whose header is intact.\n  # Checked once per run, before the first copy. Never deletes: the next\n  # PrepareImage run owns the repair.\n  if (-not $baseMatchesS3) {\n    $meta = Get-S3ObjectMetadata -BucketName {{ ArtifactBucket }} -Key 'hyperv/ubuntu-24.04-base.vhdx'\n    $s3Len = [long]$meta.Headers.ContentLength\n    $s3Sha = \"$($meta.Metadata['x-amz-meta-sha256'])\".ToLowerInvariant()\n    $baseLen = (Get-Item C:\\lab\\ubuntu-base.vhdx).Length\n    $baseSha = (Get-FileHash -Path C:\\lab\\ubuntu-base.vhdx -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()\n    if ($s3Len -le 0 -or $baseLen -ne $s3Len -or $baseSha -ne $s3Sha) {\n      throw \"C:\\lab\\ubuntu-base.vhdx ($baseLen bytes, sha256 $baseSha) is not the published s3://{{ ArtifactBucket }}/hyperv/ubuntu-24.04-base.vhdx ($s3Len bytes, sha256 '$s3Sha') - not copying it. The next PrepareImage run removes and downloads it again.\"\n    }\n    $baseMatchesS3 = $true\n  }\n  # per-VM disk. Validate the base BEFORE copying and the copy BEFORE\n  # Resize-VHD: in Event Test 15fea548 both copies failed Resize-VHD\n  # with 0x80070570 (corrupted/unreadable) after PrepareImage had\n  # accepted the base on size alone.\n  $baseValid = $false\n  try { $baseValid = [bool](Test-VHD -Path C:\\lab\\ubuntu-base.vhdx) } catch { }\n  if (-not $baseValid) {\n    throw \"C:\\lab\\ubuntu-base.vhdx fails Test-VHD before copying to $vm - corrupted or unreadable base. The next PrepareImage run removes and downloads it again.\"\n  }\n  Copy-Item C:\\lab\\ubuntu-base.vhdx \"C:\\lab\\$vm.vhdx\"\n  $copyValid = $false\n  $copyError = 'Test-VHD returned False'\n  try { $copyValid = [bool](Test-VHD -Path \"C:\\lab\\$vm.vhdx\") } catch { $copyError = $_.Exception.Message }\n  if (-not $copyValid) {\n    Remove-Item \"C:\\lab\\$vm.vhdx\" -Force -ErrorAction SilentlyContinue\n    throw \"C:\\lab\\$vm.vhdx fails Test-VHD right after Copy-Item ($copyError) - removed the broken copy. Not resizing a disk Hyper-V cannot read.\"\n  }\n  Resize-VHD -Path \"C:\\lab\\$vm.vhdx\" -SizeBytes 60GB\n  # seed disk (FAT32 CIDATA - no ISO tooling needed on Windows)\n  $prefix = \"{{ AssetsBucketPrefix }}\"\n  Read-S3Object -BucketName {{ AssetsBucket }} -Key \"${prefix}workshop/seeds/user-data-$n.yaml\" -File \"C:\\lab\\user-data-$n\" | Out-Null\n  Read-S3Object -BucketName {{ AssetsBucket }} -Key \"${prefix}workshop/seeds/meta-data-$n\" -File \"C:\\lab\\meta-data-$n\" | Out-Null\n  # FAIL LOUD: a missing key leaves a 0-byte file behind instead of\n  # throwing, and an empty seed means a VM with no network at all\n  $seedLen = (Get-Item \"C:\\lab\\user-data-$n\").Length\n  if ($seedLen -lt 200) {\n    throw \"seed user-data-$n is $seedLen bytes - expected the cloud-init config. Key: ${prefix}workshop/seeds/user-data-$n.yaml in bucket {{ AssetsBucket }}\"\n  }\n  # inject the SSH pubkey (both seeds)\n  (Get-Content \"C:\\lab\\user-data-$n\" -Raw) -replace '__IDE_SSH_PUBKEY__', $pubkey | Set-Content \"C:\\lab\\user-data-$n\" -NoNewline\n  if ($n -eq 1) {\n    # inject the self-join values (pre-joined reference node)\n    (Get-Content \"C:\\lab\\user-data-1\" -Raw) `\n      -replace '__CLUSTER_NAME__', '{{ ClusterName }}' `\n      -replace '__AWS_REGION__', $region `\n      -replace '__ACTIVATION_ID__', '{{ CreateNodeActivation.ActivationId }}' `\n      -replace '__ACTIVATION_CODE__', '{{ CreateNodeActivation.ActivationCode }}' `\n      | Set-Content \"C:\\lab\\user-data-1\" -NoNewline\n  }\n  New-VHD -Path \"C:\\lab\\seed-$n.vhdx\" -SizeBytes 64MB -Fixed | Out-Null\n  $d = Mount-VHD -Path \"C:\\lab\\seed-$n.vhdx\" -Passthru | Initialize-Disk -PartitionStyle MBR -PassThru\n  $p = New-Partition -DiskNumber $d.Number -UseMaximumSize -AssignDriveLetter\n  Format-Volume -DriveLetter $p.DriveLetter -FileSystem FAT32 -NewFileSystemLabel CIDATA | Out-Null\n  Copy-Item \"C:\\lab\\user-data-$n\" \"$($p.DriveLetter):\\user-data\"\n  Copy-Item \"C:\\lab\\meta-data-$n\" \"$($p.DriveLetter):\\meta-data\"\n  Dismount-VHD -Path \"C:\\lab\\seed-$n.vhdx\"\n  # VM (validated: Gen2, Secure Boot with MS UEFI CA template)\n  New-VM -Name $vm -MemoryStartupBytes 12GB -Generation 2 -VHDPath \"C:\\lab\\$vm.vhdx\" -SwitchName DCSwitch | Out-Null\n  Set-VM -Name $vm -ProcessorCount 6 -CheckpointType Disabled -AutomaticStartAction Start\n  Set-VMFirmware -VMName $vm -EnableSecureBoot On -SecureBootTemplate MicrosoftUEFICertificateAuthority\n  Add-VMHardDiskDrive -VMName $vm -Path \"C:\\lab\\seed-$n.vhdx\"\n  Start-VM -Name $vm\n}\n# FAIL LOUD. Copy-Item of a missing base image and New-VM with an\n# absent VHDPath are both non-terminating, so this step used to\n# report VMS_STARTED having created zero VMs (leaving only the\n# orphaned seed-*.vhdx that the 2026-09-13 host probes found).\n# Assert what the step name claims before returning success.\nforeach ($n in 1,2) {\n  $vm = \"hybrid-node-$n\"\n  $matches = @(Get-VM -Name $vm -ErrorAction SilentlyContinue)\n  if ($matches.Count -ne 1) {\n    throw \"$vm has $($matches.Count) registrations, expected exactly 1. Concurrent builders must not create duplicate VM names.\"\n  }\n  $o = $matches[0]\n  if ($o.State -ne 'Running') {\n    throw \"$vm exists but is $($o.State), expected Running.\"\n  }\n}\nWrite-Output \"VMS_STARTED (exactly one hybrid-node-1 and hybrid-node-2, both Running)\"\n} finally {\n  if ($lockTaken) { $mutex.ReleaseMutex() }\n  $mutex.Dispose()\n}\n"
+          timeoutSeconds: 1800
+        - name: HealthCheck
+          action: aws:runCommand
+          maxAttempts: 3
+          inputs:
+            DocumentName: AWS-RunPowerShellScript
+            InstanceIds:
+            - '{{ InstanceId }}'
+            Parameters:
+              commands:
+              - "Start-Sleep -Seconds 120  # cloud-init first boot\nforeach ($ip in '10.80.1.11','10.80.1.12') {\n  if (-not (Test-Connection $ip -Count 3 -Quiet)) { throw \"VM $ip not answering ICMP\" }\n  if (-not (Test-NetConnection $ip -Port 22 -InformationLevel Quiet -WarningAction SilentlyContinue)) { throw \"VM $ip SSH not open\" }\n}\nWrite-Output \"HEALTH_OK: both hybrid node VMs up on 10.80.0.0/16\"\n"
+          timeoutSeconds: 900
+        - name: VerifyPreJoinedNodeSsm
+          action: aws:waitForAwsResourceProperty
+          timeoutSeconds: 1200
+          inputs:
+            Service: ssm
+            Api: DescribeInstanceInformation
+            # Verify the OUTCOME, not which automation execution produced it. The
+            # old filter used `ActivationIds: {{ CreateNodeActivation.ActivationId }}`.
+            # That works only when this exact run creates the VM and it registers
+            # inside this exact run's 20-minute timeout. If the node registers one
+            # minute later, the next 30-minute self-heal creates a NEW activation,
+            # while the existing VM stays registered under the OLD one forever.
+            # Every re-run then times out despite a healthy `mi-*` node being Online
+            # and Ready. Measured on event 296afa1e: first run timed out 10:25, node
+            # registered under its activation 10:34, later runs kept waiting on
+            # fresh activations with RegistrationsCount=0.
+            #
+            # EC2 hosts (IDE, VPN, Hyper-V) are ResourceType=EC2Instance; hybrid
+            # activations are ResourceType=ManagedInstance. This filter therefore
+            # asks the durable question we actually care about and excludes the
+            # cloud instances without depending on an execution-scoped ID.
+            Filters:
+            - Key: ResourceType
+              Values:
+              - ManagedInstance
+            - Key: PingStatus
+              Values:
+              - Online
+            PropertySelector: $.InstanceInformationList[0].PingStatus
+            DesiredValues:
+            - Online
+
+        # SSM Online is necessary, but it is still only a bootstrap signal. The
+        # participant does not use the SSM registration - they use a Kubernetes
+        # node. Discover the IDE (the trusted kubectl vantage point already used by
+        # the workshop) and verify the real outcome there before releasing the
+        # WaitCondition.
+        - name: FindIde
+          action: aws:executeAwsApi
+          inputs:
+            Service: ec2
+            Api: DescribeInstances
+            Filters:
+            - Name: tag:workshop-role
+              Values:
+              - ide
+            - Name: instance-state-name
+              Values:
+              - running
+          outputs:
+          - Name: InstanceId
+            Selector: $.Reservations[0].Instances[0].InstanceId
+            Type: String
+
+        - name: VerifyPreJoinedNodeReady
+          action: aws:runCommand
+          timeoutSeconds: 1200
+          inputs:
+            DocumentName: AWS-RunShellScript
+            InstanceIds:
+            - '{{ FindIde.InstanceId }}'
+            Parameters:
+              commands:
+              - |
+                set -e
+                # The IDE user differs by route: `participant` on the Kiro IDE,
+                # `ec2-user` on the code-server IDE of this sample.
+                IDE_USER=participant
+                id -u "$IDE_USER" >/dev/null 2>&1 || IDE_USER=ec2-user
+                deadline=$(( $(date +%s) + 1140 ))
+                while [ "$(date +%s)" -lt "$deadline" ]; do
+                  # Run as the participant's IDE user: that home owns both the
+                  # kubeconfig and the kubectl context. SSM itself runs as root,
+                  # where `~/.kube/config` is absent and produces a false negative.
+                  if su - "$IDE_USER" -c 'kubectl get nodes -l eks.amazonaws.com/compute-type=hybrid --no-headers 2>/dev/null' | grep -q ' Ready'; then
+                    su - "$IDE_USER" -c 'kubectl get nodes -l eks.amazonaws.com/compute-type=hybrid -o wide'
+                    echo 'EKS_HYBRID_NODE_READY'
+                    exit 0
+                  fi
+                  sleep 15
+                done
+                echo 'SSM managed instance is Online, but no EKS hybrid node reached Ready within 19 minutes'
+                su - "$IDE_USER" -c 'kubectl get nodes -o wide' || true
+                exit 1
+
+        # Only NOW is the environment usable, and this is what tells the stack so.
+        # Everything above happens AFTER CloudFormation would otherwise have
+        # reported success, which is how a workshop reached "Ready" in Workshop
+        # Studio roughly 40 to 45 minutes before its VMs existed.
+        #
+        # Deliberately SUCCESS-only. A failure earlier in this document aborts
+        # before reaching here, the WaitCondition then times out, and the stack
+        # fails - which is the outcome we want, because the 30-minute association
+        # gets a chance to self-heal inside that window first. Signalling FAILURE
+        # here would fail the stack immediately and take that chance away.
+        #
+        # `onFailure: Continue` so that a problem PUTting the signal cannot turn a
+        # healthy build into a failed automation. The stack still notices, via the
+        # timeout - a lost signal degrades to the old behaviour, it does not invent
+        # a new failure mode.
+        - name: SignalCloudFormation
+          action: aws:executeScript
+          timeoutSeconds: 120
+          onFailure: Continue
+          isEnd: true
+          inputs:
+            # python3.12 is the NEWEST runtime aws:executeScript accepts - this is
+            # not the same list as Lambda, which is why the Lambdas in this template
+            # are on 3.13 and this is not. Do not "upgrade" it: SSM validates the
+            # value against its own regex at CreateDocument time and rejects 3.13
+            # and 3.14 outright, with the allowed set spelled out in the error:
+            #   python3.6|python3.7|python3.8|python3.9|python3.10|python3.11|
+            #   python3.12|PowerShell Core 6.0|PowerShell 7.0|PowerShell 8.0|
+            #   PowerShell 7.4
+            # Measured 2026-09-08. Re-probe before raising it; when SSM adds 3.13
+            # this comment is what tells you it is safe to move.
+            Runtime: python3.12
+            Handler: handler
+            InputPayload:
+              SignalUrlParam: '{{ SignalUrlParam }}'
+              InstanceId: '{{ InstanceId }}'
+            Script: |
+              import json, urllib.request, boto3
+
+              def handler(events, context):
+                  name = (events.get('SignalUrlParam') or '').strip()
+                  if not name:
+                      # Run by hand, or by an association that predates this
+                      # parameter. Nothing to signal, and that is not an error.
+                      return {'signalled': False, 'reason': 'no SignalUrlParam'}
+                  url = boto3.client('ssm').get_parameter(
+                      Name=name)['Parameter']['Value'].strip()
+                  if not url:
+                      return {'signalled': False, 'reason': 'parameter empty'}
+                  body = json.dumps({
+                      'Status': 'SUCCESS',
+                      'UniqueId': events.get('InstanceId') or 'hyperv-host',
+                      'Data': 'pre-joined hybrid node is Online in SSM and Ready in EKS',
+                      'Reason': 'VerifyPreJoinedNodeReady succeeded',
+                  }).encode()
+                  # An empty content-type is required for a WaitConditionHandle PUT;
+                  # sending a real one gets the request rejected. Same trick the
+                  # kick-off Lambda uses for its own CloudFormation response.
+                  req = urllib.request.Request(
+                      url, data=body, method='PUT',
+                      headers={'content-type': '', 'content-length': str(len(body))})
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return {'signalled': True, 'status': r.status}
+
+  # State Manager association: runs the automation on a 30-minute cadence as
+  # the fallback to the immediate kick-off, and re-applies desired state.
+  HypervAssociation:
+    Type: AWS::SSM::Association
+    DependsOn: HypervSignalUrlParam
+    Properties:
+      Name: !Ref HypervSetupDoc
+      # Automation map-target form (documented for Automation in the SSM Target
+      # API: Key=ParameterValues,Values=...): each value is passed into the
+      # runbook parameter named by AutomationTargetParameterName, so InstanceId
+      # receives the host id directly. The previous tag target
+      # (tag:workshop-role=hyperv-host) failed both scheduled executions of
+      # Event Test 15fea548 (c87e1b9c, ce49a893) before any step ran:
+      # "Failed to resolve input: InstanceIds ... Cannot Find Value for
+      # InstanceIds". The value is !Ref Host, so when Host is replaced
+      # CloudFormation updates Targets in place (Update requires: No
+      # interruption) and the next scheduled run targets the new instance.
+      AutomationTargetParameterName: InstanceId
+      Targets:
+        - Key: ParameterValues
+          Values: [!Ref Host]
+      Parameters:
+        AutomationAssumeRole: [!GetAtt AutomationRole.Arn]
+        AssetsBucket: [!Ref AssetsBucket]
+        ArtifactBucket: [!Ref ArtifactBucket]
+        AssetsBucketPrefix: !If [HasAssetsBucketPrefix, [!Ref AssetsBucketPrefix], !Ref 'AWS::NoValue']
+        ClusterName: [!Ref ClusterName]
+        # The fallback path has to be able to satisfy the WaitCondition too,
+        # otherwise a failed kick-off means the association fixes the environment
+        # while the stack times out anyway. Only the parameter NAME travels here -
+        # association parameter values are capped at 512 characters and a presigned
+        # handle URL is ~1400, which is what failed event 483f43d8 at 35 min.
+        SignalUrlParam: [!Ref HypervSignalUrlParam]
+      # WITHOUT a schedule this association evaluates once, at creation time -
+      # before the instance is registered and tagged - resolves ZERO targets and
+      # never runs again (observed 2026-08-06: an execution with Target: None and
+      # no steps, and the whole Hyper-V build had to be started by hand, which is
+      # not an option at an event). The automation is idempotent (aws:branch skips
+      # the reboot when the hypervisor is already live), so retrying is safe and
+      # it also self-heals a replaced host.
+      # ApplyOnlyAtCronInterval is supported ONLY with cron schedules; SSM
+      # rejects it with rate(...) at Association creation time. Same 30-minute
+      # cadence, but now the first association run waits for the cron boundary
+      # instead of racing the immediate custom-resource kick-off.
+      ScheduleExpression: 'cron(0/30 * * * ? *)'
+      # Do not execute immediately when the association is created. The custom
+      # resource is the single immediate kick-off. This removes the deterministic
+      # create-time race, but a stack created just before a 00/30 cron boundary can
+      # still overlap the fallback with the immediate run. CreateVMs therefore also
+      # uses a host-wide mutex; the schedule is not the concurrency control.
+      ApplyOnlyAtCronInterval: true
+
+  # ------------------------------------------------------------------------
+  # Total site isolation drill (module 5.2 / 5.4). FIS cuts the VPC<->on-prem
+  # DATA path; these documents cut the node's own path to the EKS PUBLIC
+  # endpoint. Run together, the data center is genuinely isolated - which is how
+  # the original customer demo did it, and the only way the DC-side blackbox
+  # probe (and therefore the Grafana "Cloud Reachability" panel) can go red.
+  #
+  # Two details that matter:
+  #  - Rules go in OUTPUT **and FORWARD**. Pods live in their own network
+  #    namespace and their traffic leaves the node through FORWARD, so an
+  #    OUTPUT-only rule leaves every pod - including the blackbox exporter -
+  #    still talking to AWS.
+  #  - The endpoint IPs are RE-RESOLVED on every run. They rotate, and
+  #    hardcoding them makes the drill silently do nothing.
+  # SSM itself keeps working (different IPs), so the participant never loses
+  # control of the node - that is the difference between a drill and an outage.
+  BlockControlPlaneDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: workshop-block-control-plane
+      DocumentType: Command
+      DocumentFormat: YAML
+      UpdateMethod: NewVersion
+      TargetType: /AWS::EC2::Instance
+      Content:
+        schemaVersion: '2.2'
+        description: Block hybrid node -> EKS control plane traffic (resilience drill)
+        parameters:
+          ClusterEndpoint:
+            type: String
+            description: >-
+              Cluster API hostname WITHOUT the https:// prefix. Passed in rather
+              than resolved on the node: a hybrid node has kubelet, containerd
+              and the SSM agent, but NO AWS CLI (nodeadm does not install one),
+              so `aws eks describe-cluster` fails there with "command not found"
+              (caught 2026-08-08). The participant's terminal resolves it fresh
+              at send-command time, which also keeps the endpoint from ever being
+              hardcoded - the IPs rotate.
+        mainSteps:
+          - action: aws:runShellScript
+            name: blockControlPlane
+            inputs:
+              timeoutSeconds: '300'
+              runCommand:
+                - |
+                  #!/bin/bash
+                  # shebang matters: these run on UBUNTU, where /bin/sh is dash
+                  # and `set -o pipefail` aborts with "Illegal option"
+                  # (caught 2026-08-08 - the block silently did nothing)
+                  set -uo pipefail
+                  ENDPOINT="{{ ClusterEndpoint }}"
+                  # getent is always present; dig/dnsutils may not be installed
+                  IPS=$(getent ahostsv4 "$ENDPOINT" | awk '{print $1}' | sort -u)
+                  [ -z "$IPS" ] && { echo "could not resolve $ENDPOINT"; exit 1; }
+                  for ip in $IPS; do
+                    for chain in OUTPUT FORWARD; do
+                      iptables -C "$chain" -d "$ip" -j DROP 2>/dev/null || \
+                        iptables -I "$chain" -d "$ip" -j DROP
+                    done
+                    echo "blocked $ip (OUTPUT + FORWARD)"
+                  done
+                  echo "CONTROL_PLANE_BLOCKED: $(echo $IPS | wc -w) endpoint IP(s)"
+
+  UnblockControlPlaneDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: workshop-unblock-control-plane
+      DocumentType: Command
+      DocumentFormat: YAML
+      UpdateMethod: NewVersion
+      TargetType: /AWS::EC2::Instance
+      Content:
+        schemaVersion: '2.2'
+        description: Restore hybrid node -> EKS control plane traffic
+        mainSteps:
+          - action: aws:runShellScript
+            name: unblockControlPlane
+            inputs:
+              timeoutSeconds: '300'
+              runCommand:
+                - |
+                  #!/bin/bash
+                  # see the note in the block document: Ubuntu's /bin/sh is dash
+                  set -uo pipefail
+                  # Remove every DROP rule we added, in both chains, whatever the
+                  # endpoint IPs were at block time (they may have rotated since).
+                  for chain in OUTPUT FORWARD; do
+                    while iptables -S "$chain" | grep -q -- '-j DROP'; do
+                      RULE=$(iptables -S "$chain" | grep -m1 -- '-j DROP' | sed "s/^-A $chain //")
+                      # never touch the IMDS block - the simulated DC must keep it
+                      case "$RULE" in *169.254.169.254*) break ;; esac
+                      iptables -D "$chain" $RULE || break
+                      echo "removed from $chain: $RULE"
+                    done
+                  done
+                  echo "CONTROL_PLANE_RESTORED"
+
+  # ------------------------------------------------------------------------
+  # Deterministic kick-off for the automation above.
+  # The State Manager association alone is NOT enough: it evaluates its tag
+  # targets when it is created - before the brand new Windows instance has
+  # registered with SSM - resolves ZERO targets, and reports a cheerful Success
+  # having done nothing (seen twice: 2026-08-06 in Dev and again in the first
+  # clean event, 2026-08-08, where the execution shows Mode Auto, Target None and
+  # no steps at all). The schedule then retries only 30 minutes later, so the
+  # reference hybrid node would show up long after participants arrive.
+  # This custom resource passes InstanceId EXPLICITLY, so no target resolution is
+  # involved, and returns immediately - the ~20 minute build runs in the
+  # background while the rest of the event finishes provisioning. The association
+  # stays as the self-healing retry.
+  BuildTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+        - PolicyName: start-hyperv-automation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['ssm:StartAutomationExecution']
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${HypervSetupDoc}:*'
+              - Effect: Allow
+                Action: ['iam:PassRole']
+                Resource: !GetAtt AutomationRole.Arn
+
+  BuildTriggerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 120
+      Role: !GetAtt BuildTriggerRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3
+          def respond(event, ctx, status, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f"see CloudWatch log stream {ctx.log_stream_name}",
+                  'PhysicalResourceId': event.get('PhysicalResourceId') or ctx.log_stream_name,
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'], 'Data': {}}).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                                           headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req)
+          def handler(event, ctx):
+              try:
+                  if event['RequestType'] == 'Create':
+                      p = event['ResourceProperties']
+                      params = {
+                          'InstanceId': [p['InstanceId']],
+                          'AutomationAssumeRole': [p['AutomationAssumeRole']],
+                          'AssetsBucket': [p['AssetsBucket']],
+                          'ArtifactBucket': [p['ArtifactBucket']],
+                          'ClusterName': [p['ClusterName']],
+                          'SignalUrlParam': [p.get('SignalUrlParam', '')],
+                      }
+                      # start_automation_execution rejects an explicit empty string,
+                      # although the document parameter has default ''. Omit it for
+                      # self-paced; Workshop Studio events pass a real prefix.
+                      prefix = p.get('AssetsBucketPrefix', '')
+                      if prefix:
+                          params['AssetsBucketPrefix'] = [prefix]
+                      r = boto3.client('ssm').start_automation_execution(
+                          DocumentName=p['Document'], Parameters=params)
+                      print('started', r['AutomationExecutionId'])
+                  respond(event, ctx, 'SUCCESS')
+              except Exception as e:
+                  # never fail the stack over the kick-off: the scheduled
+                  # association is the fallback path
+                  print('trigger error:', e)
+                  respond(event, ctx, 'SUCCESS', reason=str(e))
+
+  # The stack must not report success until the environment is USABLE. CloudFormation
+  # finishing only means the host exists; the Hyper-V role install, the reboot, the
+  # DC network, the image, both VMs and the pre-join all happen afterwards, and that
+  # is 40 to 45 minutes during which Workshop Studio says Ready and a participant
+  # finds nothing. Measured on a real event: deployment success 05:49, VMs reachable
+  # 06:31. For a Builders' Session a table whose VMs never built cannot be rescued
+  # in the room, so the honest place to discover it is provisioning.
+  #
+  # The automation's last step PUTs SUCCESS to this handle. Timeout is 90 minutes,
+  # sized to cover ONE self-heal cycle rather than just the happy path: if the
+  # fire-and-forget kick-off never lands, the 30-minute association picks it up and
+  # the ~45 minutes of real work still fits inside the window.
+  HypervWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  # Indirection on purpose: the automation reads the handle URL from here instead of
+  # receiving it, because a State Manager association caps parameter values at 512
+  # characters and a presigned handle URL is around 1400. A String parameter allows
+  # 4096, so this is the only place the URL fits.
+  HypervSignalUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/workshop/${WorkshopName}/hyperv-signal-url'
+      Type: String
+      Value: !Ref HypervWaitHandle
+      Description: WaitConditionHandle URL signalled by the last step of the Hyper-V setup automation
+
+  HypervWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: StartHypervBuild
+    Properties:
+      Handle: !Ref HypervWaitHandle
+      Timeout: '5400'
+      Count: 1
+
+  StartHypervBuild:
+    Type: Custom::StartHypervBuild
+    DependsOn: [Host, HypervAssociation]
+    Properties:
+      ServiceToken: !GetAtt BuildTriggerFn.Arn
+      Document: !Ref HypervSetupDoc
+      InstanceId: !Ref Host
+      AutomationAssumeRole: !GetAtt AutomationRole.Arn
+      AssetsBucket: !Ref AssetsBucket
+      ArtifactBucket: !Ref ArtifactBucket
+      AssetsBucketPrefix: !Ref AssetsBucketPrefix
+      ClusterName: !Ref ClusterName
+      SignalUrlParam: !Ref HypervSignalUrlParam
+
+Outputs:
+  HostInstanceId: {Value: !Ref Host, Export: {Name: !Sub '${WorkshopName}-hyperv-host-id'}}
+  HostEniId: {Value: !Ref HostEni}
