@@ -45,7 +45,7 @@ Karpenter.
 ## Guided Workshop
 
 This repository contains the deployable code and assets. The guided workshop,
-*Amazon EKS Hybrid Nodes: On-Premises Resilience and GPU Cloud Bursting*, explains the architecture,
+[*Amazon EKS Hybrid Nodes: On-Premises Resilience and GPU Cloud Bursting*](https://catalog.us-east-1.prod.workshops.aws/workshops/1204c8ab-bc93-4b8d-baf5-6f03de0b36dd), explains the architecture,
 modules and operational decisions step by step. Its self-paced route clones this repository and
 uses the same participant assets as an AWS-hosted event.
 
